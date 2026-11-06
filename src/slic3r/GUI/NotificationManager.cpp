@@ -3344,6 +3344,21 @@ void NotificationManager::set_in_preview(bool preview)
     }
 }
 
+std::vector<NotificationManager::ActiveNotification> NotificationManager::active_notifications() const
+{
+    std::vector<ActiveNotification> out;
+    for (const auto& n : m_pop_notifications) {
+        if (n->is_finished())
+            continue;
+        const NotificationData& d = n->get_data();
+        std::string text = d.text1;
+        if (!d.hypertext.empty()) text += " " + d.hypertext;
+        if (!d.text2.empty()) text += " " + d.text2;
+        out.push_back({d.level, text, n->is_gray()});
+    }
+    return out;
+}
+
 bool NotificationManager::has_slicing_error_notification()
 {
 	return std::any_of(m_pop_notifications.begin(), m_pop_notifications.end(), [](auto &n) {

@@ -1,10 +1,13 @@
 #include "ControlServer.hpp"
+#include "ControlServerCommands.hpp"
 
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
 #include "Tab.hpp"
+#include "Selection.hpp"
+#include "NotificationManager.hpp"
 #include "DeviceManager.hpp"
 #include "DeviceCore/DevManager.h"
 #include "libslic3r/Model.hpp"
@@ -136,6 +139,13 @@ json cmd_status(const json&)
     }
     r["plates"]        = plate_list;
     r["current_plate"] = plates.get_curr_plate_index();
+    r["filament_tab_preset"] = pb->filaments.get_edited_preset().name;
+    r["busy"]          = !p.get_ui_job_worker().is_idle(); // arrange / orient / other jobs running
+    r["preview_shown"] = p.is_preview_shown();
+    json selection     = json::array();
+    for (const auto& [obj, instances] : p.get_selection().get_content())
+        selection.push_back(obj);
+    r["selection"] = selection;
     return r;
 }
 
@@ -263,6 +273,12 @@ json cmd_slice_result(const json& body)
     }
     if (GCodeProcessorResult* gcode = plate->get_slice_result())
         r["time_s"] = gcode->print_statistics.modes[0].time;
+    // Errors the slicer is showing (e.g. "empty first layer"): slicing will not finish until they are fixed.
+    json errors = json::array();
+    for (const auto& n : plater().get_notification_manager()->active_notifications())
+        if (n.level == NotificationManager::NotificationLevel::ErrorNotificationLevel && !n.outdated && !n.text.empty())
+            errors.push_back(n.text);
+    r["errors"] = errors;
     return r;
 }
 
@@ -324,20 +340,24 @@ json cmd_printer_command(const json& body)
     return json{{"dev_id", dev_id}, {"result", rc}, {"ok", rc == 0}};
 }
 
-using Command = json (*)(const json&);
+using Command = ControlCommands::Handler;
 const std::map<std::string, Command>& commands()
 {
-    static const std::map<std::string, Command> table = {
-        {"status", cmd_status},
-        {"load_files", cmd_load_files},
-        {"reload_from_disk", cmd_reload_from_disk},
-        {"get_settings", cmd_get_settings},
-        {"set_settings", cmd_set_settings},
-        {"slice", cmd_slice},
-        {"slice_result", cmd_slice_result},
-        {"printers", cmd_printers},
-        {"printer_command", cmd_printer_command},
-    };
+    static const std::map<std::string, Command> table = [] {
+        std::map<std::string, Command> t = {
+            {"status", cmd_status},
+            {"load_files", cmd_load_files},
+            {"reload_from_disk", cmd_reload_from_disk},
+            {"get_settings", cmd_get_settings},
+            {"set_settings", cmd_set_settings},
+            {"slice", cmd_slice},
+            {"slice_result", cmd_slice_result},
+            {"printers", cmd_printers},
+            {"printer_command", cmd_printer_command},
+        };
+        ControlCommands::add_model_commands(t);
+        return t;
+    }();
     return table;
 }
 

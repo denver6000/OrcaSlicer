@@ -397,6 +397,10 @@ public:
     void bbl_show_3mf_warn_notification(const std::string &text, NotificationLevel level = NotificationLevel::ErrorNotificationLevel);
     void bbl_close_3mf_warn_notification();
 
+    // For the control API: the notifications still on screen (level, text, and whether greyed out as outdated).
+    struct ActiveNotification { NotificationLevel level; std::string text; bool outdated; };
+    std::vector<ActiveNotification> active_notifications() const;
+
     //BBS--preview only mode
     void bbl_show_preview_only_notification(const std::string &text);
     void bbl_close_preview_only_notification();

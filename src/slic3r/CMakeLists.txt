@@ -102,6 +102,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/ConfigWizard.cpp
     GUI/ControlServer.cpp
     GUI/ControlServer.hpp
+    GUI/ControlServerCommands.cpp
+    GUI/ControlServerCommands.hpp
     GUI/ConfigWizard.hpp
     GUI/ConfigWizardTypes.hpp
     GUI/ConfigWizard_private.hpp
