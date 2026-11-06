@@ -68,6 +68,8 @@ Add this to `.mcp.json` in your project, or use `claude mcp add`:
 | `paint` | Paint supports, seams, colors or fuzzy skin by overhang angle, facing direction, box or height band |
 | `add_shape` / `remove_part` / `edit_part` | Add modifiers, enforcers, blockers, negative parts or parts; rename, retype, set filament |
 | `object_settings` | Per-object, per-part and per-height-range process overrides |
+| `plate_type` | Read or set the build plate type, as the sidebar's plate drop-down does (sets the bed temperatures used, and the Textured PEI first-layer offset) |
+| `dialogs` / `answer_dialog` | List the dialogs open in OrcaSlicer with their message and controls, and answer one as a click would. A tool that opens a dialog returns `blocked_by_dialog` with its description instead of timing out |
 | `connect_printer` | Add a Bambu printer in LAN Only mode by IP and access code (from its screen), select it and wait for its first status report. OrcaSlicer saves it and reconnects on its own after that. Switches the printer preset to the open LAN connection if needed |
 | `send_print` | Send a sliced plate to the selected printer and start it, as the Print dialog's Send does: checks the printer is idle with storage, the slice is valid and for this printer model, and the filament feed (external spool, or AMS trays via `ams_slots`); waits for the upload and for the printer to start. Options: bed leveling, flow calibration, timelapse |
 | `printers` | Connected printers with a status summary, or why a connection failed |
