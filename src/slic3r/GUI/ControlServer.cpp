@@ -16,6 +16,24 @@
 #include "Jobs/PlaterWorker.hpp"
 #include "Jobs/PrintJob.hpp"
 #include "Jobs/Worker.hpp"
+#include "GeometryImportDialog.hpp"
+#include "Widgets/Button.hpp"
+#include "Widgets/ComboBox.hpp"
+#include "Widgets/RadioGroup.hpp"
+
+#include <wx/checkbox.h>
+#include <wx/choice.h>
+#include <wx/combobox.h>
+#include <wx/dialog.h>
+#include <wx/radiobut.h>
+#include <wx/stattext.h>
+#include <wx/textctrl.h>
+#include <wx/tglbtn.h>
+#include <wx/utils.h>
+#include <boost/algorithm/string.hpp>
+#include <atomic>
+#include <cstdint>
+#include <sstream>
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -86,23 +104,219 @@ boost::filesystem::path path_from_utf8(const std::string& s)
 #endif
 }
 
-// Runs `fn` on the GUI thread and waits for its result.
+// ---------------------------------------------------------------------------- dialogs (GUI thread)
+//
+// A modal dialog runs its own event loop, which still runs the control API's CallAfter work. So
+// while one is open the API can read it and answer it as a click would: buttons are pressed by
+// sending their wxEVT_BUTTON, toggles and choices are set and then notify like a click, and the
+// dialog's own handlers run (saving "remember my choice", closing, continuing the interrupted
+// command).
+
+std::string dialog_id(const wxWindow* w) { return std::to_string(reinterpret_cast<std::uintptr_t>(w)); }
+
+std::string clean_label(const wxString& s)
+{
+    std::string out = into_u8(wxStripMenuCodes(s));
+    boost::algorithm::trim(out);
+    return out;
+}
+
+bool same_label(const std::string& a, const std::string& b)
+{
+    std::string x = a, y = b;
+    for (std::string* s : {&x, &y}) {
+        boost::algorithm::trim(*s);
+        boost::algorithm::to_lower(*s);
+        while (!s->empty() && (s->back() == '.' || s->back() == ':'))
+            s->pop_back();
+    }
+    return x == y;
+}
+
+// Dialogs on screen, topmost (last created) first.
+std::vector<wxDialog*> open_dialogs()
+{
+    std::vector<wxDialog*> out;
+    for (wxWindowList::compatibility_iterator n = wxTopLevelWindows.GetFirst(); n; n = n->GetNext())
+        if (auto* d = dynamic_cast<wxDialog*>(n->GetData()); d && d->IsShown())
+            out.push_back(d);
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+struct DialogControls
+{
+    std::vector<std::string>                       message;
+    std::vector<std::pair<wxWindow*, std::string>> buttons;    // window, label
+    std::vector<std::pair<wxWindow*, std::string>> checkboxes; // toggles: wxCheckBox, Orca CheckBox/SwitchButton, wxToggleButton
+    std::vector<wxWindow*>                         radios;     // Orca RadioGroup, or a wxRadioButton
+    std::vector<wxWindow*>                         choices;    // wxChoice, wxComboBox, Orca ComboBox
+    std::vector<wxTextCtrl*>                       texts;
+};
+
+void collect_controls(wxWindow* parent, DialogControls& c)
+{
+    const wxWindowList& children = parent->GetChildren();
+    for (auto it = children.begin(); it != children.end(); ++it) {
+        wxWindow* w = *it;
+        if (!w->IsShown())
+            continue;
+        if (dynamic_cast<RadioGroup*>(w) || dynamic_cast<wxRadioButton*>(w)) {
+            c.radios.push_back(w);
+            continue;
+        }
+        if (auto* cb = dynamic_cast<wxCheckBox*>(w)) {
+            c.checkboxes.emplace_back(cb, clean_label(cb->GetLabel()));
+            continue;
+        }
+        if (dynamic_cast<wxToggleButton*>(w) || dynamic_cast<wxBitmapToggleButton*>(w)) {
+            // Orca's check boxes carry no text; their label is the static text created next to them.
+            std::string label = clean_label(w->GetLabel());
+            for (auto next = std::next(it); label.empty() && next != children.end(); ++next) {
+                if (auto* st = dynamic_cast<wxStaticText*>(*next)) {
+                    label = clean_label(st->GetLabel());
+                    break;
+                }
+                if ((*next)->IsShown() && !dynamic_cast<wxStaticText*>(*next))
+                    break;
+            }
+            c.checkboxes.emplace_back(w, label);
+            continue;
+        }
+        if (dynamic_cast<wxItemContainer*>(w) && (dynamic_cast<wxChoice*>(w) || dynamic_cast<wxComboBox*>(w) || dynamic_cast<::ComboBox*>(w))) {
+            c.choices.push_back(w);
+            continue;
+        }
+        if (dynamic_cast<::Button*>(w) || dynamic_cast<wxButton*>(w)) {
+            c.buttons.emplace_back(w, clean_label(w->GetLabel()));
+            continue;
+        }
+        if (auto* tc = dynamic_cast<wxTextCtrl*>(w)) {
+            c.texts.push_back(tc);
+            continue;
+        }
+        if (auto* st = dynamic_cast<wxStaticText*>(w)) {
+            const std::string text = clean_label(st->GetLabel());
+            if (!text.empty())
+                c.message.push_back(text);
+            continue;
+        }
+        collect_controls(w, c);
+    }
+}
+
+wxItemContainer* items_of(wxWindow* w) { return dynamic_cast<wxItemContainer*>(w); }
+
+json describe_dialog(wxDialog* d)
+{
+    DialogControls c;
+    collect_controls(d, c);
+    json r = {{"id", dialog_id(d)}, {"title", clean_label(d->GetTitle())}, {"modal", d->IsModal()}};
+    std::string message;
+    for (const std::string& line : c.message)
+        message += (message.empty() ? "" : "\n") + line;
+    r["message"] = message;
+    json buttons = json::array();
+    for (const auto& [w, label] : c.buttons)
+        buttons.push_back({{"label", label}, {"enabled", w->IsEnabled()}});
+    r["buttons"] = buttons;
+    json checks = json::array();
+    for (const auto& [w, label] : c.checkboxes) {
+        bool value = false;
+        if (auto* cb = dynamic_cast<wxCheckBox*>(w)) value = cb->GetValue();
+        else if (auto* tb = dynamic_cast<wxToggleButton*>(w)) value = tb->GetValue();
+        else if (auto* bb = dynamic_cast<wxBitmapToggleButton*>(w)) value = bb->GetValue();
+        checks.push_back({{"label", label}, {"value", value}, {"enabled", w->IsEnabled()}});
+    }
+    r["checkboxes"] = checks;
+    json radios = json::array();
+    for (wxWindow* w : c.radios) {
+        if (auto* rg = dynamic_cast<RadioGroup*>(w)) {
+            DialogControls inner;
+            collect_controls(rg, inner);
+            json options = json::array();
+            for (const auto& [b, label] : inner.buttons)
+                options.push_back(label);
+            const int sel = rg->GetSelection();
+            radios.push_back({{"options", options}, {"selected", sel >= 0 && sel < int(options.size()) ? options[sel] : json()}});
+        } else if (auto* rb = dynamic_cast<wxRadioButton*>(w)) {
+            radios.push_back({{"options", json::array({clean_label(rb->GetLabel())})}, {"selected", rb->GetValue() ? json(clean_label(rb->GetLabel())) : json()}});
+        }
+    }
+    r["radios"] = radios;
+    json choices = json::array();
+    for (wxWindow* w : c.choices) {
+        wxItemContainer* items = items_of(w);
+        json options = json::array();
+        for (unsigned i = 0; i < items->GetCount(); ++i)
+            options.push_back(into_u8(items->GetString(i)));
+        const int sel = items->GetSelection();
+        choices.push_back({{"options", options}, {"selected", sel >= 0 ? json(into_u8(items->GetString(sel))) : json()}});
+    }
+    r["choices"] = choices;
+    json texts = json::array();
+    for (wxTextCtrl* t : c.texts)
+        texts.push_back({{"value", into_u8(t->GetValue())}, {"editable", t->IsEditable()}});
+    r["texts"] = texts;
+    return r;
+}
+
+json modal_dialogs()
+{
+    json list = json::array();
+    for (wxDialog* d : open_dialogs())
+        if (d->IsModal())
+            list.push_back(describe_dialog(d));
+    return list;
+}
+
+// Runs `fn` on the GUI thread and waits for its result. If a modal dialog opens while `fn` runs
+// (it waits for an answer), returns that dialog instead of timing out: `fn` carries on once the
+// dialog is answered (answer_dialog), and its result then shows in the slicer's state.
 json run_on_gui(std::function<json()> fn, std::chrono::seconds timeout = std::chrono::seconds(60))
 {
     auto promise = std::make_shared<std::promise<json>>();
     auto future  = promise->get_future();
-    wxGetApp().CallAfter([promise, fn]() {
+    auto done    = std::make_shared<std::atomic<bool>>(false);
+    wxGetApp().CallAfter([promise, fn, done]() {
         try {
-            promise->set_value(fn());
+            json r = fn();
+            done->store(true);
+            promise->set_value(std::move(r));
         } catch (const std::exception& e) {
+            done->store(true);
             promise->set_value(json{{"error", e.what()}});
         }
     });
-    const auto until = std::chrono::steady_clock::now() + timeout;
+    const auto start = std::chrono::steady_clock::now();
+    const auto until = start + timeout;
+    // A probe queued behind `fn` runs only while `fn` is still on the stack, i.e. inside a nested
+    // event loop such as a modal dialog's.
+    auto       probe        = std::make_shared<std::mutex>();
+    auto       found        = std::make_shared<json>();
+    auto       probe_queued = std::make_shared<std::atomic<bool>>(false);
+    auto       next_probe   = start + std::chrono::milliseconds(1500);
     // Waits in slices so shutdown, which blocks the GUI thread, is never held up.
     while (future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
-        if (s_stopping || std::chrono::steady_clock::now() > until)
+        const auto now = std::chrono::steady_clock::now();
+        if (s_stopping || now > until)
             return json{{"error", "timed out waiting for the OrcaSlicer window"}};
+        {
+            std::lock_guard<std::mutex> lock(*probe);
+            if (found->is_array() && !found->empty())
+                return json{{"blocked_by_dialog", *found},
+                            {"note", "OrcaSlicer is waiting for an answer to this dialog. answer_dialog answers it; the "
+                                     "command then finishes on its own (check the result with the usual read tools)."}};
+        }
+        if (now > next_probe && !probe_queued->exchange(true)) {
+            next_probe = now + std::chrono::seconds(2);
+            wxGetApp().CallAfter([probe, found, probe_queued, done]() {
+                json dialogs = done->load() ? json::array() : modal_dialogs();
+                std::lock_guard<std::mutex> lock(*probe);
+                *found = std::move(dialogs);
+                probe_queued->store(false);
+            });
+        }
     }
     return future.get();
 }
@@ -114,6 +328,146 @@ Plater& plater()
     if (!wxGetApp().plater())
         throw std::runtime_error("the main window is not ready");
     return *wxGetApp().plater();
+}
+
+json cmd_dialogs(const json&)
+{
+    json list = json::array();
+    for (wxDialog* d : open_dialogs())
+        list.push_back(describe_dialog(d));
+    return json{{"dialogs", list}};
+}
+
+// Answers an open dialog: sets its check boxes, radio groups, choices and text fields, then
+// presses a button, each as a click would.
+json cmd_answer_dialog(const json& body)
+{
+    wxDialog* dialog = nullptr;
+    const std::vector<wxDialog*> dialogs = open_dialogs();
+    const std::string            want    = body.value("dialog", std::string());
+    for (wxDialog* d : dialogs)
+        if (want.empty() ? d->IsModal() : (dialog_id(d) == want || same_label(clean_label(d->GetTitle()), want))) {
+            dialog = d;
+            break;
+        }
+    if (!dialog)
+        throw std::runtime_error(want.empty() ? "no dialog is waiting for an answer" : "no open dialog '" + want + "'; see dialogs");
+
+    DialogControls c;
+    collect_controls(dialog, c);
+    json changed = json::object();
+
+    if (body.contains("set") && body["set"].is_object()) {
+        for (const auto& [key, value] : body["set"].items()) {
+            bool done = false;
+            // A check box, by its label.
+            for (const auto& [w, label] : c.checkboxes) {
+                if (!same_label(label, key))
+                    continue;
+                const bool on = value.is_boolean() ? value.get<bool>() : (value.is_string() && (value == "true" || value == "on"));
+                wxEventType type = wxEVT_TOGGLEBUTTON;
+                if (auto* cb = dynamic_cast<wxCheckBox*>(w)) {
+                    cb->SetValue(on);
+                    type = wxEVT_CHECKBOX;
+                } else if (auto* tb = dynamic_cast<wxToggleButton*>(w)) {
+                    tb->SetValue(on);
+                } else if (auto* bb = dynamic_cast<wxBitmapToggleButton*>(w)) {
+                    bb->SetValue(on);
+                }
+                wxCommandEvent evt(type, w->GetId());
+                evt.SetInt(on ? 1 : 0);
+                evt.SetEventObject(w);
+                w->GetEventHandler()->ProcessEvent(evt);
+                changed[label] = on;
+                done = true;
+                break;
+            }
+            // A radio group or choice, by one of its options ("set": {"<option>": true}), or
+            // by index ("set": {"radio:0": "<option>"}, {"choice:1": "<option>"}).
+            auto pick_radio = [&](RadioGroup* rg, const std::string& option) {
+                DialogControls inner;
+                collect_controls(rg, inner);
+                for (size_t i = 0; i < inner.buttons.size(); ++i)
+                    if (same_label(inner.buttons[i].second, option)) {
+                        rg->SetSelection(int(i), true);
+                        changed["radio"] = inner.buttons[i].second;
+                        return true;
+                    }
+                return false;
+            };
+            auto pick_choice = [&](wxWindow* w, const std::string& option) {
+                wxItemContainer* items = items_of(w);
+                for (unsigned i = 0; i < items->GetCount(); ++i)
+                    if (same_label(into_u8(items->GetString(i)), option)) {
+                        items->SetSelection(int(i));
+                        wxCommandEvent evt(dynamic_cast<wxChoice*>(w) ? wxEVT_CHOICE : wxEVT_COMBOBOX, w->GetId());
+                        evt.SetInt(int(i));
+                        evt.SetString(items->GetString(i));
+                        evt.SetEventObject(w);
+                        w->GetEventHandler()->ProcessEvent(evt);
+                        changed["choice"] = into_u8(items->GetString(i));
+                        return true;
+                    }
+                return false;
+            };
+            if (!done && key.rfind("radio:", 0) == 0) {
+                const size_t idx = std::stoul(key.substr(6));
+                if (idx < c.radios.size())
+                    if (auto* rg = dynamic_cast<RadioGroup*>(c.radios[idx]))
+                        done = pick_radio(rg, value.get<std::string>());
+            } else if (!done && key.rfind("choice:", 0) == 0) {
+                const size_t idx = std::stoul(key.substr(7));
+                if (idx < c.choices.size())
+                    done = pick_choice(c.choices[idx], value.get<std::string>());
+            } else if (!done && key.rfind("text:", 0) == 0) {
+                const size_t idx = std::stoul(key.substr(5));
+                if (idx < c.texts.size()) {
+                    c.texts[idx]->SetValue(wxString::FromUTF8(value.is_string() ? value.get<std::string>() : value.dump()));
+                    changed[key] = value;
+                    done = true;
+                }
+            }
+            if (!done && value.is_boolean() && value.get<bool>()) {
+                for (wxWindow* w : c.radios)
+                    if (auto* rg = dynamic_cast<RadioGroup*>(w); rg && pick_radio(rg, key)) { done = true; break; }
+                for (size_t i = 0; !done && i < c.choices.size(); ++i)
+                    done = pick_choice(c.choices[i], key);
+            }
+            if (!done)
+                throw std::runtime_error("'" + key + "' matches no check box, radio option, choice or text field of this dialog "
+                                         "(nothing was pressed); see dialogs");
+        }
+    }
+
+    std::string pressed;
+    if (body.contains("button")) {
+        const std::string label = body["button"].get<std::string>();
+        wxWindow*         btn   = nullptr;
+        for (const auto& [w, l] : c.buttons)
+            if (same_label(l, label)) {
+                btn     = w;
+                pressed = l;
+                break;
+            }
+        if (!btn) {
+            json labels = json::array();
+            for (const auto& [w, l] : c.buttons)
+                labels.push_back(l);
+            throw std::runtime_error("no button '" + label + "' in this dialog; its buttons are " + labels.dump());
+        }
+        if (!btn->IsEnabled())
+            throw std::runtime_error("the '" + pressed + "' button is disabled");
+        wxCommandEvent evt(wxEVT_BUTTON, btn->GetId());
+        evt.SetEventObject(btn);
+        btn->GetEventHandler()->ProcessEvent(evt);
+        // A standard button whose handler did not close the dialog closes it as wxWidgets would.
+        const int id = btn->GetId();
+        if (dialog->IsShown() && dialog->IsModal() &&
+            (id == wxID_OK || id == wxID_CANCEL || id == wxID_YES || id == wxID_NO || id == wxID_CLOSE || id == wxID_APPLY))
+            dialog->EndModal(id);
+    }
+    return json{{"dialog", clean_label(dialog->GetTitle())}, {"set", changed}, {"pressed", pressed},
+                {"closed", !dialog->IsShown()}};
 }
 
 json cmd_status(const json&)
@@ -160,6 +514,8 @@ json cmd_status(const json&)
     return r;
 }
 
+const std::map<std::string, ControlCommands::Handler>& commands();
+
 json cmd_load_files(const json& body)
 {
     if (!body.contains("paths") || !body["paths"].is_array() || body["paths"].empty())
@@ -174,8 +530,92 @@ json cmd_load_files(const json& body)
     Plater& p = plater();
     if (body.value("replace", false))
         p.delete_all_objects_from_model();
+
+    // The import dialogs (3MF/AMF naming, name cleanup, STEP mesh quality) are modal: nobody answers
+    // them for this request, which then times out. Load with their remembered choices instead, and
+    // put the user's settings back afterwards.
+    AppConfig*                                        cfg = wxGetApp().app_config;
+    std::vector<std::pair<std::string, std::string>> saved;
+    for (const char* key : {"import_names_3mf_show_dialog", "import_names_amf_show_dialog", "import_names_cleanup_show_dialog",
+                            "enable_step_mesh_setting"}) {
+        saved.emplace_back(key, cfg->has(key) ? cfg->get(key) : std::string());
+        cfg->set_bool(key, false);
+    }
+    ScopeGuard restore([cfg, &saved]() {
+        for (const auto& [key, value] : saved) {
+            if (value.empty())
+                cfg->erase("app", key);
+            else
+                cfg->set(key, value);
+        }
+    });
+
+    // Loading a model into an empty project can start a new project, which reselects the presets
+    // last saved for this printer and drops unsaved edits (it turned a selected ABS back into PLA).
+    // A model file carries no presets, so put the user's back afterwards; a project file's own
+    // presets are meant to apply.
+    PresetBundle* pb      = wxGetApp().preset_bundle;
+    bool          plain   = true;
+    for (const auto& path : paths)
+        if (boost::algorithm::iends_with(path.string(), ".3mf") && !is_geometry_only_3mf(path.string()))
+            plain = false;
+    struct Snapshot
+    {
+        std::string                        printer, process;
+        std::vector<std::string>           filaments;
+        std::map<std::string, json>        dirty; // type -> {key: serialized value}
+    } before;
+    before.printer   = pb->printers.get_selected_preset_name();
+    before.process   = pb->prints.get_selected_preset_name();
+    before.filaments = pb->filament_presets;
+    for (const auto& [type, coll] : {std::pair<std::string, PresetCollection*>{"printer", &pb->printers},
+                                     {"process", &pb->prints}, {"filament", &pb->filaments}}) {
+        json values = json::object();
+        for (const std::string& key : coll->current_dirty_options())
+            values[key] = coll->get_edited_preset().config.opt_serialize(key);
+        before.dirty[type] = values;
+    }
+
     const std::vector<size_t> loaded = p.load_files(paths, LoadStrategy::LoadModel);
-    return json{{"loaded_object_indices", loaded}, {"object_count", p.model().objects.size()}};
+    json r = {{"loaded_object_indices", loaded}, {"object_count", p.model().objects.size()}};
+
+    if (plain) {
+        json restored = json::object();
+        const auto& cmds = commands();
+        auto select = [&](const std::string& type, const std::string& name, int slot) {
+            json b = {{"type", type}, {"name", name}, {"discard_changes", true}};
+            if (slot >= 0)
+                b["slot"] = slot;
+            cmds.at("select_preset")(b);
+        };
+        if (pb->printers.get_selected_preset_name() != before.printer) {
+            select("printer", before.printer, -1);
+            restored["printer"] = before.printer;
+        }
+        if (pb->prints.get_selected_preset_name() != before.process) {
+            select("process", before.process, -1);
+            restored["process"] = before.process;
+        }
+        for (size_t i = 0; i < before.filaments.size() && i < pb->filament_presets.size(); ++i)
+            if (pb->filament_presets[i] != before.filaments[i]) {
+                select("filament", before.filaments[i], int(i));
+                restored["filament_" + std::to_string(i)] = before.filaments[i];
+            }
+        for (const auto& [type, values] : before.dirty) {
+            PresetCollection& coll = type == "printer" ? pb->printers : type == "process" ? pb->prints : pb->filaments;
+            json lost = json::object();
+            for (const auto& [key, value] : values.items())
+                if (coll.get_edited_preset().config.opt_serialize(key) != value.get<std::string>())
+                    lost[key] = value;
+            if (!lost.empty()) {
+                cmds.at("set_settings")(json{{"values", lost}, {"scope", type}});
+                restored[type + "_edits"] = lost;
+            }
+        }
+        if (!restored.empty())
+            r["presets_restored"] = restored;
+    }
+    return r;
 }
 
 json cmd_reload_from_disk(const json&)
@@ -569,6 +1009,33 @@ json start_print_send(const json& body, const std::shared_ptr<PrintSend>& state)
         throw std::runtime_error("the plate was sliced for printer model " + sliced + " but " + printer + " is " + target +
                                  "; select a matching printer preset and slice again");
 
+    // The nozzle the plate was sliced for must be the one the printer reports; a P1S pauses a
+    // mismatched job before the first layer with error 0500-803C.
+    const DynamicPrintConfig full = bundle->full_config();
+    json printer_status = json::object();
+    if (auto* lan = dynamic_cast<BambuLanPrinterAgent*>(printer_agent().get()))
+        printer_status = lan->printer_status(obj->get_dev_id());
+    const double sliced_nozzle = full.option<ConfigOptionFloats>("nozzle_diameter")->values.front();
+    std::string  sliced_nozzle_type = full.opt_serialize("nozzle_type");
+    sliced_nozzle_type = sliced_nozzle_type.substr(0, sliced_nozzle_type.find(','));
+    if (printer_status.contains("nozzle_diameter")) {
+        double printer_nozzle = 0;
+        try {
+            printer_nozzle = printer_status["nozzle_diameter"].is_string() ? std::stod(printer_status["nozzle_diameter"].get<std::string>()) :
+                                                                             printer_status["nozzle_diameter"].get<double>();
+        } catch (...) {}
+        if (printer_nozzle > 0 && std::abs(printer_nozzle - sliced_nozzle) > 0.01) {
+            std::ostringstream msg;
+            msg << printer << " has a " << printer_nozzle << " mm nozzle but the plate was sliced for " << sliced_nozzle
+                << " mm; select the printer preset for that nozzle and slice again";
+            throw std::runtime_error(msg.str());
+        }
+    }
+    json notes = json::array();
+    const std::string printer_nozzle_type = printer_status.value("nozzle_type", std::string());
+    if (!printer_nozzle_type.empty() && sliced_nozzle_type != "undefine" && printer_nozzle_type != sliced_nozzle_type)
+        notes.push_back("the printer reports a " + printer_nozzle_type + " nozzle; the preset says " + sliced_nozzle_type);
+
     // Filaments: which printer slot feeds each filament the plate uses.
     const std::vector<int> used        = plate->get_extruders(true); // 1-based filament numbers
     const size_t           n_filaments = bundle->filament_presets.size();
@@ -606,6 +1073,45 @@ json start_print_send(const json& body, const std::shared_ptr<PrintSend>& state)
                                      " has no AMS, so it can only print one; assign one filament to every object");
         for (int f : used)
             feeds[std::to_string(f)] = "external spool";
+        // The spool's type, when the printer knows it (set on its screen or by RFID).
+        const std::string spool = printer_status.contains("vt_tray") ? printer_status["vt_tray"].value("tray_type", std::string()) : std::string();
+        const auto*       types = full.option<ConfigOptionStrings>("filament_type");
+        const std::string sliced_type = !used.empty() && types && size_t(used.front()) <= types->values.size() ? types->values[used.front() - 1] : std::string();
+        if (!spool.empty() && !sliced_type.empty() && !boost::algorithm::iequals(spool, sliced_type) && !body.value("allow_filament_mismatch", false))
+            throw std::runtime_error("the external spool is set to " + spool + " on the printer but the plate was sliced for " + sliced_type +
+                                     "; select the matching filament and slice again (or pass allow_filament_mismatch if the "
+                                     "printer's spool setting is out of date)");
+    }
+
+    // What the plate was sliced with, for the record (a valid slice matches the current settings).
+    json sliced_with;
+    {
+        const std::string bed      = full.opt_serialize("curr_bed_type");
+        static const std::map<std::string, std::string> bed_keys = {
+            {"Cool Plate", "cool_plate_temp"},          {"Engineering Plate", "eng_plate_temp"},
+            {"High Temp Plate", "hot_plate_temp"},      {"Textured PEI Plate", "textured_plate_temp"},
+            {"Supertack Plate", "supertack_plate_temp"}, {"Textured Cool Plate", "textured_cool_plate_temp"}};
+        const int   f   = used.empty() ? 0 : used.front() - 1;
+        auto        nth = [&](const std::string& key) {
+            if (!full.has(key))
+                return std::string();
+            std::vector<std::string> parts;
+            const std::string        all = full.opt_serialize(key);
+            boost::algorithm::split(parts, all, boost::is_any_of(","));
+            return size_t(f) < parts.size() ? parts[f] : all;
+        };
+        sliced_with["printer_preset"]  = bundle->printers.get_selected_preset_name();
+        sliced_with["process_preset"]  = bundle->prints.get_selected_preset_name();
+        sliced_with["filament_preset"] = size_t(f) < bundle->filament_presets.size() ? bundle->filament_presets[f] : std::string();
+        sliced_with["filament_type"]   = nth("filament_type");
+        sliced_with["nozzle"]          = std::to_string(sliced_nozzle).substr(0, 4) + " mm " + sliced_nozzle_type;
+        sliced_with["nozzle_temp"]     = nth("nozzle_temperature_initial_layer") + " first layer, " + nth("nozzle_temperature");
+        sliced_with["plate"]           = bed;
+        if (auto it = bed_keys.find(bed); it != bed_keys.end())
+            sliced_with["bed_temp"] = nth(it->second + "_initial_layer") + " first layer, " + nth(it->second);
+        sliced_with["layer_height"]    = full.opt_serialize("layer_height");
+        sliced_with["brim"]            = full.opt_serialize("brim_type") + " " + full.opt_serialize("brim_width") + " mm";
+        sliced_with["supports"]        = full.opt_bool("enable_support") ? full.opt_serialize("support_type") : "off";
     }
 
     // Package the sliced plate, as the Print dialog does before it sends.
@@ -656,7 +1162,9 @@ json start_print_send(const json& body, const std::shared_ptr<PrintSend>& state)
                 {"use_ams", use_ams},
                 {"bed_leveling", leveling},
                 {"flow_calibration", flow_cali},
-                {"timelapse", timelapse}};
+                {"timelapse", timelapse},
+                {"sliced_with", sliced_with},
+                {"notes", notes}};
 }
 
 // Sends the sliced plate to the selected printer and starts it, as the Print dialog's Send does,
@@ -728,6 +1236,8 @@ const std::map<std::string, Command>& commands()
             {"slice_result", cmd_slice_result},
             {"printers", cmd_printers},
             {"printer_command", cmd_printer_command},
+            {"dialogs", cmd_dialogs},
+            {"answer_dialog", cmd_answer_dialog},
         };
         ControlCommands::add_model_commands(t);
         return t;

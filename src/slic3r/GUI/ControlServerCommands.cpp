@@ -39,6 +39,7 @@
 #include <vector>
 
 #include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/beast/core/detail/base64.hpp>
 #include <wx/glcanvas.h>
 #include <wx/dcmemory.h>
@@ -1619,6 +1620,15 @@ json cmd_select_preset(const json& body)
         const size_t slot = body.value("slot", 0);
         if (slot >= pb->filament_presets.size())
             throw std::runtime_error("there are " + std::to_string(pb->filament_presets.size()) + " filament slots");
+        // A system filament the user never added (Add/Remove filaments) is hidden, and selecting it
+        // silently falls back to the first visible one. Add it as that dialog does.
+        if (Preset* preset = c.find_preset(name, false, true); preset && preset->is_system && !preset->is_visible) {
+            preset->is_visible = true;
+            wxGetApp().app_config->set(AppConfig::SECTION_FILAMENTS, preset->name, "true");
+            if (const Preset* parent = c.get_preset_parent(*preset); parent && parent->is_system)
+                wxGetApp().app_config->set(AppConfig::SECTION_FILAMENTS, parent->name, "true");
+            wxGetApp().app_config->save();
+        }
         if (pb->filament_presets.size() == 1 || slot == 0)
             tab->select_preset(name, false, "", true);
         pb->set_filament_preset(slot, name);
@@ -1629,7 +1639,69 @@ json cmd_select_preset(const json& body)
         tab->select_preset(name, false, "", true);
     }
     p.on_config_change(pb->full_config());
-    return json{{"type", type}, {"selected", c.get_selected_preset_name()}, {"filaments", pb->filament_presets}};
+    const std::string selected = type == "filament" ? pb->filament_presets[body.value("slot", 0)] : c.get_selected_preset_name();
+    if (selected != name)
+        throw std::runtime_error("OrcaSlicer selected '" + selected + "' instead of '" + name +
+                                 "' (it may not be compatible with the printer or process); list_presets shows what fits");
+    return json{{"type", type}, {"selected", selected}, {"filaments", pb->filament_presets}};
+}
+
+// Reads or sets the build plate type (the sidebar's plate drop-down). It picks the bed
+// temperatures from the filament and, for Textured PEI, a first-layer Z offset in the start G-code.
+json cmd_plate_type(const json& body)
+{
+    Plater&                     p        = plater();
+    DynamicPrintConfig&         proj     = wxGetApp().preset_bundle->project_config;
+    const ConfigOptionDef*      def      = print_config_def.get("curr_bed_type");
+    const t_config_enum_values* keys_map = def->enum_keys_map;
+    const BedType               current  = proj.opt_enum<BedType>("curr_bed_type");
+    auto                        name_of  = [&](BedType t) {
+        for (const auto& [name, value] : *keys_map)
+            if (value == int(t))
+                return name;
+        return std::string();
+    };
+    // The types this printer offers, as the drop-down lists them.
+    json options = json::array();
+    for (const auto& [name, value] : *keys_map) {
+        if (value == int(btDefault) || value >= int(btCount))
+            continue;
+        p.on_bed_type_change(BedType(value));
+        if (p.sidebar().get_cur_select_bed_type() == BedType(value))
+            options.push_back(name);
+    }
+    p.on_bed_type_change(current);
+    if (!body.contains("type"))
+        return json{{"plate_type", name_of(current)}, {"options", options}};
+
+    const std::string want = body["type"].get<std::string>();
+    BedType           wanted = btCount;
+    for (const auto& [name, value] : *keys_map)
+        if (boost::algorithm::iequals(name, want))
+            wanted = BedType(value);
+    bool offered = false;
+    for (const auto& o : options)
+        offered = offered || o.get<std::string>() == name_of(wanted);
+    if (wanted == btCount || !offered)
+        throw std::runtime_error("'" + want + "' is not a plate type this printer offers; options: " + options.dump());
+    if (wanted == current)
+        return json{{"plate_type", name_of(current)}, {"changed", false}};
+
+    // What picking it in the drop-down does (Plater::priv::on_select_bed_type).
+    p.on_bed_type_change(wanted);
+    proj.set_key_value("curr_bed_type", new ConfigOptionEnum<BedType>(wanted));
+    p.update_project_dirty_from_presets();
+    p.on_config_change(wxGetApp().preset_bundle->full_config());
+    wxGetApp().obj_list()->update_and_show_object_settings_item();
+    AppConfig* app_config = wxGetApp().app_config;
+    app_config->set("curr_bed_type", std::to_string(int(wanted)));
+    app_config->set_printer_setting(wxGetApp().preset_bundle->printers.get_selected_preset_name(), "curr_bed_type",
+                                    std::to_string(int(wanted)));
+    for (PartPlate* plate : p.get_partplate_list().get_plate_list())
+        if (plate->get_bed_type() == btDefault)
+            plate->update_slice_result_valid_state(false);
+    return json{{"plate_type", name_of(wanted)}, {"previous", name_of(current)}, {"changed", true},
+                {"note", "plates that follow the project's plate type need slicing again"}};
 }
 
 json cmd_discard_preset_changes(const json& body)
@@ -2049,6 +2121,7 @@ void add_model_commands(std::map<std::string, Handler>& table)
     table["select_preset"]         = cmd_select_preset;
     table["discard_preset_changes"] = cmd_discard_preset_changes;
     table["save_preset"]           = cmd_save_preset;
+    table["plate_type"]            = cmd_plate_type;
     table["calibrate"]             = cmd_calibrate;
     table["settings_layout"]       = cmd_settings_layout;
     table["set_settings"]          = cmd_set_settings;

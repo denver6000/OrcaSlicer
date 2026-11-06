@@ -55,6 +55,12 @@ Good habits:
 - Printers: connect_printer(ip, access_code) adds a Bambu printer in LAN Only mode; OrcaSlicer
   then remembers it. printers shows status; camera_snapshot shows the chamber. send_print starts
   a sliced plate on the printer: only when the user asked to print it.
+- Before slicing for a print, read back the settings that matter (get_settings: printer and
+  nozzle, filament preset and type, temperatures, plate_type, brim, supports) and compare them
+  with the printer (printers full=True: nozzle_diameter, nozzle_type) and the camera (which
+  plate is on the bed). Ask the user which nozzle and filament are loaded when unsure.
+- Dialogs: a tool that returns blocked_by_dialog is waiting on a dialog; dialogs and
+  answer_dialog read and answer it (see answer_dialog for which ones to answer yourself).
 
 The user is not a tuning expert. When settings come up:
 - explain(topic) gives a plain-language background (pressure advance, flow ratio, max volumetric
@@ -135,8 +141,50 @@ async def slicer_status() -> dict[str, Any]:
 @mcp.tool()
 async def load_models(paths: list[str], replace: bool = False) -> dict[str, Any]:
     """Load model files (STL, 3MF, STEP, OBJ...) into the slicer. With replace=True, removes every
-    object first. Paths must be absolute."""
+    object first. Paths must be absolute. Import dialogs are skipped (their remembered choices
+    apply, e.g. original names kept). Loading a plain model can make OrcaSlicer reselect the
+    presets saved for the printer; the selected presets and unsaved edits are then put back and
+    listed in presets_restored. A project 3MF's own presets apply as usual."""
     return await _acall("load_files", {"paths": paths, "replace": replace})
+
+
+@mcp.tool()
+async def plate_type(type: str | None = None) -> dict[str, Any]:
+    """Read or set the build plate type (the sidebar's plate drop-down), e.g. "Textured PEI Plate",
+    "High Temp Plate", "Cool Plate", "Engineering Plate". It must match the plate on the printer:
+    it selects the filament's bed temperatures for that plate and, for Textured PEI, a first-layer
+    nozzle offset. Without type, returns the current one and the options. Slice again after."""
+    return await _acall("plate_type", {"type": type} if type else {})
+
+
+@mcp.tool()
+async def dialogs() -> dict[str, Any]:
+    """Dialogs open in OrcaSlicer: title, message, buttons, check boxes, radio groups, choices and
+    text fields with their values. A command that opens a dialog waiting for an answer returns
+    blocked_by_dialog with the same description instead of timing out."""
+    return await _acall("dialogs")
+
+
+@mcp.tool()
+async def answer_dialog(button: str | None = None, set: dict[str, Any] | None = None,
+                        dialog: str | None = None) -> dict[str, Any]:
+    """Answer an open dialog as a user would: `set` changes controls first, then `button` is
+    pressed (both optional). dialog is the id or title (default: the one waiting for an answer).
+    set: {"<check box label>": true/false, "<radio or choice option>": true,
+    "radio:0": "<option>", "choice:0": "<option>", "text:0": "<value>"}.
+
+    Answer on your own only dialogs that ask HOW to do what was asked (import naming, mesh quality,
+    which plate...). Ask the user first for anything that discards, overwrites or deletes their
+    work or presets, or affects the printer. Say what you answered. The interrupted command then
+    finishes; check its effect with the usual tools."""
+    body: dict[str, Any] = {}
+    if button:
+        body["button"] = button
+    if set:
+        body["set"] = set
+    if dialog:
+        body["dialog"] = dialog
+    return await _acall("answer_dialog", body)
 
 
 @mcp.tool()
@@ -838,14 +886,16 @@ async def connect_printer(ip: str, access_code: str, name: str | None = None, ti
 @mcp.tool()
 async def send_print(plate: int | None = None, name: str | None = None, bed_leveling: bool = True,
                      flow_calibration: bool = False, timelapse: bool = False, ams_slots: list[int] | None = None,
-                     timeout_s: int = 180) -> dict[str, Any]:
+                     timeout_s: int = 180, allow_filament_mismatch: bool = False) -> dict[str, Any]:
     """Send a sliced plate to the selected printer and START PRINTING it, as the Print dialog's
     Send button does. This makes the real printer heat up and move: only call it when the user
     has asked to print this plate now, and say what will print (object, filament, time) first.
 
     Before calling: the plate is sliced (slice), check_errors is clean, and printers shows the
     printer connected and idle with a clear bed (camera_snapshot helps). The plate must be sliced
-    with a preset for this printer model. A printer without an AMS prints one filament from the
+    with a preset for this printer model and nozzle (the printer reports its nozzle; a mismatch is
+    refused), the loaded filament, and plate_type matching the plate on the bed. The answer's
+    sliced_with lists filament, temperatures, plate, layers, brim and supports: check it. A printer without an AMS prints one filament from the
     external spool; with an AMS, ams_slots gives one tray per filament the plate uses (0-3 = AMS 1
     slots 1-4, 4-7 = AMS 2..., -1 = external spool; the error lists the filaments when missing).
 
@@ -859,6 +909,8 @@ async def send_print(plate: int | None = None, name: str | None = None, bed_leve
         body["name"] = name
     if ams_slots is not None:
         body["ams_slots"] = ams_slots
+    if allow_filament_mismatch:
+        body["allow_filament_mismatch"] = True
     return await _acall("send_print", body, timeout=timeout_s + 150)
 
 
