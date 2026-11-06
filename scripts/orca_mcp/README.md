@@ -69,6 +69,7 @@ Add this to `.mcp.json` in your project, or use `claude mcp add`:
 | `add_shape` / `remove_part` / `edit_part` | Add modifiers, enforcers, blockers, negative parts or parts; rename, retype, set filament |
 | `object_settings` | Per-object, per-part and per-height-range process overrides |
 | `connect_printer` | Add a Bambu printer in LAN Only mode by IP and access code (from its screen), select it and wait for its first status report. OrcaSlicer saves it and reconnects on its own after that. Switches the printer preset to the open LAN connection if needed |
+| `send_print` | Send a sliced plate to the selected printer and start it, as the Print dialog's Send does: checks the printer is idle with storage, the slice is valid and for this printer model, and the filament feed (external spool, or AMS trays via `ams_slots`); waits for the upload and for the printer to start. Options: bed leveling, flow calibration, timelapse |
 | `printers` | Connected printers with a status summary, or why a connection failed |
 | `camera_snapshot` | Latest camera frame as an image |
 | `printer_light`, `printer_pause`, `printer_resume`, `printer_stop`, `printer_speed`, `printer_gcode` | Printer controls |

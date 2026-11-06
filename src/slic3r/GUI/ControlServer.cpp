@@ -10,6 +10,12 @@
 #include "NotificationManager.hpp"
 #include "DeviceManager.hpp"
 #include "DeviceCore/DevManager.h"
+#include "DeviceCore/DevStorage.h"
+#include "Jobs/BoostThreadWorker.hpp"
+#include "Jobs/NotificationProgressIndicator.hpp"
+#include "Jobs/PlaterWorker.hpp"
+#include "Jobs/PrintJob.hpp"
+#include "Jobs/Worker.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -27,6 +33,7 @@
 #include <functional>
 #include <future>
 #include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -401,6 +408,313 @@ json cmd_printer_command(const json& body)
     return json{{"dev_id", dev_id}, {"result", rc}, {"ok", rc == 0}};
 }
 
+// ---------------------------------------------------------------------------- sending prints
+
+// Progress and outcome of the print job send_print queued, written by the job's worker thread
+// and read by the server thread.
+struct PrintSend
+{
+    std::mutex  mutex;
+    bool        done    = false;
+    bool        ok      = false;
+    int         percent = 0;
+    std::string message;
+    std::string error;
+
+    void finish(bool success, const std::string& why = {})
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (done)
+            return;
+        done = true;
+        ok   = success;
+        if (!success && error.empty())
+            error = why.empty() ? (message.empty() ? std::string("the print job stopped") : message) : why;
+    }
+};
+
+// Runs a PrintJob, the same job the Print dialog runs, and records what it reports. The window
+// shows its progress as for a print sent from the dialog.
+class AgentPrintJob : public Job
+{
+public:
+    AgentPrintJob(std::unique_ptr<PrintJob> job, std::shared_ptr<PrintSend> state)
+        : m_job(std::move(job)), m_state(std::move(state))
+    {}
+
+    void process(Ctl& ctl) override
+    {
+        struct Recorder : Ctl
+        {
+            Ctl&       inner;
+            PrintSend& st;
+            Recorder(Ctl& inner, PrintSend& st) : inner(inner), st(st) {}
+            void update_status(int s, const std::string& msg) override
+            {
+                {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    st.percent = s;
+                    if (!msg.empty())
+                        st.message = msg;
+                }
+                inner.update_status(s, msg);
+            }
+            bool was_canceled() const override { return inner.was_canceled(); }
+            void clear_percent() override { inner.clear_percent(); }
+            void show_error_info(const std::string& msg, int code, const std::string& description, const std::string& extra) override
+            {
+                {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    st.error = msg.empty() ? description : msg;
+                }
+                inner.show_error_info(msg, code, description, extra);
+            }
+            std::future<void> call_on_main_thread(std::function<void()> fn) override { return inner.call_on_main_thread(std::move(fn)); }
+        } recorder(ctl, *m_state);
+
+        m_job->process(recorder);
+        bool failed;
+        {
+            std::lock_guard<std::mutex> lock(m_state->mutex);
+            failed = !m_state->error.empty();
+        }
+        // why: is_finished() is also set when the upload check fails; that path records an error first
+        m_state->finish(m_job->is_finished() && !failed);
+    }
+
+    void finalize(bool canceled, std::exception_ptr& e) override
+    {
+        m_job->finalize(canceled, e);
+        if (canceled)
+            m_state->finish(false, "the print job was cancelled");
+        else if (e)
+            m_state->finish(false, "the print job failed with an internal error (see the OrcaSlicer log)");
+        else
+            m_state->finish(false); // no-op once process() has finished
+    }
+
+private:
+    std::unique_ptr<PrintJob>  m_job;
+    std::shared_ptr<PrintSend> m_state;
+};
+
+Worker& print_worker()
+{
+    static std::unique_ptr<Worker> worker;
+    if (!worker)
+        worker = std::make_unique<PlaterWorker<BoostThreadWorker>>(
+            &plater(), std::make_shared<NotificationProgressIndicator>(plater().get_notification_manager()), "agent_print_worker");
+    return *worker;
+}
+
+std::string project_name_for_print(const json& body)
+{
+    if (body.contains("name") && body["name"].is_string() && !body["name"].get<std::string>().empty())
+        return body["name"].get<std::string>();
+    const std::string project = into_u8(plater().get_project_name());
+    if (!project.empty() && project != "Untitled")
+        return project;
+    const Model& model = wxGetApp().model();
+    if (!model.objects.empty())
+        return boost::filesystem::path(model.objects.front()->name).stem().string();
+    return "print";
+}
+
+// Checks the printer and plate and queues the print job (GUI thread). Throws with the reason a
+// print cannot be sent.
+json start_print_send(const json& body, const std::shared_ptr<PrintSend>& state)
+{
+    Plater&        p   = plater();
+    DeviceManager* dm  = wxGetApp().getDeviceManager();
+    MachineObject* obj = dm ? dm->get_selected_machine() : nullptr;
+    if (!obj)
+        throw std::runtime_error("no printer is selected; connect_printer first");
+    const std::string printer = obj->get_dev_name().empty() ? obj->get_dev_id() : obj->get_dev_name();
+    if (!obj->is_connected())
+        throw std::runtime_error(printer + " is not connected right now; check printers");
+    if (obj->is_in_upgrading())
+        throw std::runtime_error(printer + " is updating its firmware");
+    if (obj->is_system_printing())
+        throw std::runtime_error(printer + " is busy with a system task (e.g. calibration); try again when it ends");
+    if (obj->is_in_printing())
+        throw std::runtime_error(printer + " is already printing; it must finish or be stopped first");
+    if (!print_worker().is_idle())
+        throw std::runtime_error("a print is already being sent");
+
+    const auto sd = obj->GetStorage()->get_sdcard_state();
+    if (sd == DevStorage::SdcardState::NO_SDCARD)
+        throw std::runtime_error(printer + " has no storage card; printing over LAN needs one");
+    if (sd == DevStorage::SdcardState::HAS_SDCARD_READONLY)
+        throw std::runtime_error(printer + "'s storage card is read-only");
+
+    PartPlateList& plates = p.get_partplate_list();
+    const int      idx    = body.value("plate", plates.get_curr_plate_index());
+    if (!plates.get_plate(idx))
+        throw std::runtime_error("no plate " + std::to_string(idx));
+    if (idx != plates.get_curr_plate_index())
+        p.select_plate(idx);
+    PartPlate* plate = plates.get_plate(idx);
+    if (!plate->is_slice_result_valid())
+        throw std::runtime_error("plate " + std::to_string(idx) + " is not sliced, or changed since it was; slice it first");
+    if (!plate->is_slice_result_ready_for_print())
+        throw std::runtime_error("plate " + std::to_string(idx) + "'s slice has errors (toolpaths outside the bed or a "
+                                 "G-code check failure); see check_errors");
+
+    // The preset the plate was sliced with must be for this printer model (P1P and P1S share one).
+    PresetBundle*     bundle = wxGetApp().preset_bundle;
+    const std::string sliced = bundle->printers.get_edited_preset().get_printer_type(bundle);
+    const std::string target = obj->printer_type;
+    const bool        p1     = (sliced == "C11" || sliced == "C12") && (target == "C11" || target == "C12");
+    if (!sliced.empty() && !target.empty() && sliced != target && !p1 && !body.value("allow_other_model", false))
+        throw std::runtime_error("the plate was sliced for printer model " + sliced + " but " + printer + " is " + target +
+                                 "; select a matching printer preset and slice again");
+
+    // Filaments: which printer slot feeds each filament the plate uses.
+    const std::vector<int> used        = plate->get_extruders(true); // 1-based filament numbers
+    const size_t           n_filaments = bundle->filament_presets.size();
+    std::string            ams_mapping;
+    bool                   use_ams = false;
+    json                   feeds   = json::object();
+    if (obj->HasAms()) {
+        if (!body.contains("ams_slots") || !body["ams_slots"].is_array() || body["ams_slots"].size() != used.size()) {
+            json list = json::array();
+            for (int f : used)
+                list.push_back(f);
+            throw std::runtime_error("this printer has an AMS: pass ams_slots with one tray per filament the plate uses "
+                                     "(filaments " + list.dump() + ", in that order): 0-3 = AMS 1 slots 1-4, 4-7 = AMS 2, "
+                                     "and so on; -1 = the external spool");
+        }
+        json v0 = json::array();
+        for (size_t i = 0; i < n_filaments; ++i)
+            v0.push_back(-1);
+        bool has_ams = false, has_ext = false;
+        for (size_t k = 0; k < used.size(); ++k) {
+            const int tray = body["ams_slots"][k].get<int>();
+            if (tray < -1 || tray > 15)
+                throw std::runtime_error("ams_slots values are 0-15 (AMS trays) or -1 (external spool)");
+            if (used[k] >= 1 && size_t(used[k]) <= n_filaments)
+                v0[used[k] - 1] = tray;
+            (tray >= 0 ? has_ams : has_ext) = true;
+            feeds[std::to_string(used[k])] = tray >= 0 ? "AMS " + std::to_string(tray / 4 + 1) + " slot " + std::to_string(tray % 4 + 1) :
+                                                         std::string("external spool");
+        }
+        ams_mapping = v0.dump();
+        use_ams     = has_ams;
+    } else {
+        if (used.size() > 1)
+            throw std::runtime_error("the plate uses " + std::to_string(used.size()) + " filaments but " + printer +
+                                     " has no AMS, so it can only print one; assign one filament to every object");
+        for (int f : used)
+            feeds[std::to_string(f)] = "external spool";
+    }
+
+    // Package the sliced plate, as the Print dialog does before it sends.
+    if (p.send_gcode(idx, [](int, int, int, bool&) {}) < 0)
+        throw std::runtime_error("the sliced plate could not be packaged; slice it again");
+
+    const std::string name       = project_name_for_print(body);
+    const bool        leveling   = body.value("bed_leveling", true);
+    const bool        flow_cali  = body.value("flow_calibration", false);
+    const bool        timelapse  = body.value("timelapse", false);
+
+    auto job            = std::make_unique<PrintJob>(obj->get_dev_id());
+    job->m_dev_ip       = obj->get_dev_ip();
+    job->m_ftp_folder   = obj->get_ftp_folder();
+    job->m_access_code  = obj->get_access_code();
+#if !BBL_RELEASE_TO_PUBLIC
+    job->m_local_use_ssl_for_ftp = wxGetApp().app_config->get("enable_ssl_for_ftp") == "true";
+    job->m_local_use_ssl         = wxGetApp().app_config->get("enable_ssl_for_mqtt") == "true";
+#else
+    job->m_local_use_ssl_for_ftp = obj->local_use_ssl_for_ftp;
+    job->m_local_use_ssl         = obj->local_use_ssl;
+#endif
+    job->connection_type  = obj->connection_type();
+    job->cloud_print_only = obj->is_support_cloud_print_only;
+    job->m_print_type     = "from_normal";
+    job->set_project_name(name);
+    job->task_ams_mapping = ams_mapping;
+    job->task_use_ams     = use_ams;
+    job->sdcard_state     = sd;
+    job->has_sdcard       = wxGetApp().app_config->get("allow_abnormal_storage") == "true" ?
+                                (sd == DevStorage::SdcardState::HAS_SDCARD_NORMAL || sd == DevStorage::SdcardState::HAS_SDCARD_ABNORMAL) :
+                                sd == DevStorage::SdcardState::HAS_SDCARD_NORMAL;
+    job->could_emmc_print = obj->can_use_emmc_print();
+    job->set_print_config("auto", leveling, flow_cali, false, timelapse, true, false, leveling ? 1 : 0, flow_cali ? 1 : 0, 0);
+    job->on_check_ip_address_fail([state]() {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = "the file could not be uploaded to the printer (FTPS, port 990); check its storage card and access code";
+    });
+
+    replace_job(print_worker(), std::make_shared<AgentPrintJob>(std::move(job), state));
+    BOOST_LOG_TRIVIAL(info) << "ControlServer: sending plate " << idx << " (" << name << ") to " << obj->get_dev_id();
+
+    return json{{"dev_id", obj->get_dev_id()},
+                {"printer", printer},
+                {"plate", idx},
+                {"name", name},
+                {"filaments", feeds},
+                {"use_ams", use_ams},
+                {"bed_leveling", leveling},
+                {"flow_calibration", flow_cali},
+                {"timelapse", timelapse}};
+}
+
+// Sends the sliced plate to the selected printer and starts it, as the Print dialog's Send does,
+// then waits for the upload and for the printer to take the job. Server thread.
+json cmd_send_print(const json& body)
+{
+    const int wait_s = std::clamp(body.value("timeout_s", 180), 10, 900);
+    auto      state  = std::make_shared<PrintSend>();
+    json      r      = run_on_gui([body, state]() { return start_print_send(body, state); }, std::chrono::seconds(120));
+    if (r.contains("error"))
+        return r;
+
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(wait_s);
+    while (!s_stopping) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->done)
+                break;
+        }
+        if (std::chrono::steady_clock::now() > until) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            r["sent"] = false;
+            r["note"] = "still sending (" + std::to_string(state->percent) + "%: " + state->message +
+                        "); check printers in a moment";
+            return r;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->ok)
+            return json{{"error", "the print was not sent: " + state->error}, {"printer", r["printer"]}, {"plate", r["plate"]}};
+    }
+    r["sent"] = true;
+
+    // The printer answers with PREPARE (heating, levelling) and then RUNNING.
+    auto  agent_holder = std::make_shared<std::shared_ptr<IPrinterAgent>>();
+    run_on_gui([agent_holder]() {
+        *agent_holder = printer_agent();
+        return json::object();
+    });
+    if (auto* lan = dynamic_cast<BambuLanPrinterAgent*>(agent_holder->get())) {
+        const std::string dev_id  = r["dev_id"].get<std::string>();
+        const auto        started = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::string       gstate;
+        while (!s_stopping && std::chrono::steady_clock::now() < started) {
+            const json status = lan->printer_status(dev_id);
+            gstate            = status.value("gcode_state", std::string());
+            if (gstate == "PREPARE" || gstate == "RUNNING" || gstate == "SLICING")
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        r["printer_state"] = gstate;
+        r["status"]        = status_summary(lan->printer_status(dev_id));
+    }
+    return r;
+}
+
 using Command = ControlCommands::Handler;
 const std::map<std::string, Command>& commands()
 {
@@ -427,6 +741,7 @@ const std::map<std::string, Command>& background_commands()
 {
     static const std::map<std::string, Command> table = {
         {"connect_printer", cmd_connect_printer},
+        {"send_print", cmd_send_print},
     };
     return table;
 }

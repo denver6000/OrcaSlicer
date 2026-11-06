@@ -53,7 +53,8 @@ Good habits:
   transform_object(down=...). Then decide supports (enable_support, support_type, paint, enforcers).
 - Settings edits (set_settings) change the active presets without saving. save_preset keeps them.
 - Printers: connect_printer(ip, access_code) adds a Bambu printer in LAN Only mode; OrcaSlicer
-  then remembers it. printers shows status; camera_snapshot shows the chamber.
+  then remembers it. printers shows status; camera_snapshot shows the chamber. send_print starts
+  a sliced plate on the printer: only when the user asked to print it.
 
 The user is not a tuning expert. When settings come up:
 - explain(topic) gives a plain-language background (pressure advance, flow ratio, max volumetric
@@ -832,6 +833,33 @@ async def connect_printer(ip: str, access_code: str, name: str | None = None, ti
     if notes:
         result["notes"] = notes
     return result
+
+
+@mcp.tool()
+async def send_print(plate: int | None = None, name: str | None = None, bed_leveling: bool = True,
+                     flow_calibration: bool = False, timelapse: bool = False, ams_slots: list[int] | None = None,
+                     timeout_s: int = 180) -> dict[str, Any]:
+    """Send a sliced plate to the selected printer and START PRINTING it, as the Print dialog's
+    Send button does. This makes the real printer heat up and move: only call it when the user
+    has asked to print this plate now, and say what will print (object, filament, time) first.
+
+    Before calling: the plate is sliced (slice), check_errors is clean, and printers shows the
+    printer connected and idle with a clear bed (camera_snapshot helps). The plate must be sliced
+    with a preset for this printer model. A printer without an AMS prints one filament from the
+    external spool; with an AMS, ams_slots gives one tray per filament the plate uses (0-3 = AMS 1
+    slots 1-4, 4-7 = AMS 2..., -1 = external spool; the error lists the filaments when missing).
+
+    Waits for the upload and for the printer to take the job (printer_state PREPARE or RUNNING).
+    Stop a print with printer_stop."""
+    body: dict[str, Any] = {"bed_leveling": bed_leveling, "flow_calibration": flow_calibration,
+                            "timelapse": timelapse, "timeout_s": timeout_s}
+    if plate is not None:
+        body["plate"] = plate
+    if name:
+        body["name"] = name
+    if ams_slots is not None:
+        body["ams_slots"] = ams_slots
+    return await _acall("send_print", body, timeout=timeout_s + 150)
 
 
 @mcp.tool()
