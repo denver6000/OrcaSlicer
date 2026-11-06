@@ -365,6 +365,7 @@ src/slic3r/GUI/WebViewDialog.cpp
 src/slic3r/GUI/Widgets/AMSItem.cpp
 src/slic3r/GUI/Widgets/DialogButtons.cpp
 src/slic3r/Utils/NetworkAgentFactory.cpp
+src/slic3r/Utils/BambuLanPrinterAgent.cpp
 src/slic3r/Utils/MoonrakerPrinterAgent.cpp
 src/slic3r/Utils/BBLNetworkPlugin.cpp
 src/slic3r/Utils/OrcaCloudServiceAgent.cpp

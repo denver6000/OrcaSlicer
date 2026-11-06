@@ -5,6 +5,7 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
+#include "ControlServer.hpp"
 #include "GUI_App.hpp"
 #include "BBLTopbar.hpp"
 #include "Shortcuts.hpp"
@@ -2929,6 +2930,7 @@ bool GUI_App::OnInit()
 
 int GUI_App::OnExit()
 {
+    ControlServer::instance().stop();
     stop_http_server();
     stop_sync_user_preset();
     if (m_startup_cloud_plugin_fetch_thread.joinable())
@@ -3813,6 +3815,8 @@ bool GUI_App::on_init_inner()
 #endif
     if (scrn) { scrn->SetText(_L("Showing main window") + dots, 95); wxYield(); }
     mainframe->Show(true);
+    // Orca fork: local control API for automation (127.0.0.1 only, token in control_server.json)
+    ControlServer::instance().start();
     // Close the splash now that the main UI is visible.
     if (scrn) { scrn->SetText(_L("Showing main window") + dots, 100); scrn->Destroy(); scrn = nullptr; }
     BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
@@ -4412,7 +4416,7 @@ void GUI_App::switch_printer_agent()
         // point at the previously active printer preset. Re-select the machine when the new
         // preset targets a different host, otherwise filament sync keeps hitting the old
         // printer. (#12506)
-        if (effective_agent_id != BBL_PRINTER_AGENT_ID && m_device_manager && preset_bundle) {
+        if (!is_bambu_protocol_agent(effective_agent_id) && m_device_manager && preset_bundle) {
             const std::string print_host = config.opt_string("print_host");
             if (!print_host.empty()) {
                 const std::string dev_id = MachineObject::dev_id_from_address(print_host, config.opt_string("printhost_port"));
@@ -4465,7 +4469,7 @@ void GUI_App::select_machine(const std::string& agent_id)
     // selected, as BambuStudio does at startup: a saved LAN printer now, a cloud printer once the
     // account's machine list arrives. Directly, not through the Device tab's selection flow, which
     // would also queue a nozzle sync for the next visit to Prepare.
-    if (agent_id == BBL_PRINTER_AGENT_ID) {
+    if (is_bambu_protocol_agent(agent_id)) {
         m_device_manager->restore_last_machine();
         return;
     }

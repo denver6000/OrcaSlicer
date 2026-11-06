@@ -100,6 +100,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/ConfigValueFormatter.cpp
     GUI/ConfigValueFormatter.hpp
     GUI/ConfigWizard.cpp
+    GUI/ControlServer.cpp
+    GUI/ControlServer.hpp
     GUI/ConfigWizard.hpp
     GUI/ConfigWizardTypes.hpp
     GUI/ConfigWizard_private.hpp
@@ -807,6 +809,12 @@ set(SLIC3R_GUI_SOURCES
     Utils/QidiPrinterAgent.hpp
     Utils/SnapmakerPrinterAgent.cpp
     Utils/SnapmakerPrinterAgent.hpp
+    Utils/BambuLanCamera.cpp
+    Utils/BambuLanCamera.hpp
+    Utils/BambuLanMqtt.cpp
+    Utils/BambuLanMqtt.hpp
+    Utils/BambuLanPrinterAgent.cpp
+    Utils/BambuLanPrinterAgent.hpp
     Utils/MoonrakerPrinterAgent.cpp
     Utils/MoonrakerPrinterAgent.hpp
     Utils/Moonraker.cpp

@@ -19,6 +19,15 @@ namespace Slic3r {
 static constexpr char ORCA_PRINTER_AGENT_ID[] = "orca";
 static constexpr char BBL_PRINTER_AGENT_ID[] = "bbl";
 static constexpr char MOONRAKER_PRINTER_AGENT_ID[] = "moonraker";
+// Open LAN agent for Bambu Lab printers in LAN Only + Developer Mode (no Bambu network plugin).
+static constexpr char BAMBU_LAN_PRINTER_AGENT_ID[] = "bambu_lan";
+
+// Agents that speak Bambu Lab's printer protocol and use its printer workflow (saved LAN
+// printers, access codes, restore of the last printer), as opposed to a print-host preset.
+inline bool is_bambu_protocol_agent(const std::string& agent_id)
+{
+    return agent_id == BBL_PRINTER_AGENT_ID || agent_id == BAMBU_LAN_PRINTER_AGENT_ID;
+}
 
 // Factory function type for creating printer agents
 using PrinterAgentFactory =
