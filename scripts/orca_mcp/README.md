@@ -14,7 +14,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI assistant such 
 - list, compare, select and save presets
 - set up OrcaSlicer's calibration tests for tuning a filament
 - slice, read the slice results, and take screenshots of the 3D view
-- watch and control Bambu Lab printers connected with the **Bambu Lab (LAN, open)** printer agent
+- connect, watch and control Bambu Lab printers through the **Bambu Lab (LAN, open)** printer agent
 
 You keep using the slicer window as usual and see every change happen.
 
@@ -68,7 +68,8 @@ Add this to `.mcp.json` in your project, or use `claude mcp add`:
 | `paint` | Paint supports, seams, colors or fuzzy skin by overhang angle, facing direction, box or height band |
 | `add_shape` / `remove_part` / `edit_part` | Add modifiers, enforcers, blockers, negative parts or parts; rename, retype, set filament |
 | `object_settings` | Per-object, per-part and per-height-range process overrides |
-| `printers` | Connected printers with a status summary |
+| `connect_printer` | Add a Bambu printer in LAN Only mode by IP and access code (from its screen), select it and wait for its first status report. OrcaSlicer saves it and reconnects on its own after that. Switches the printer preset to the open LAN connection if needed |
+| `printers` | Connected printers with a status summary, or why a connection failed |
 | `camera_snapshot` | Latest camera frame as an image |
 | `printer_light`, `printer_pause`, `printer_resume`, `printer_stop`, `printer_speed`, `printer_gcode` | Printer controls |
 

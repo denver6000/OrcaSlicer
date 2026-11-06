@@ -15,10 +15,14 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/AppConfig.hpp"
 #include "slic3r/Utils/BambuLanPrinterAgent.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/NetworkAgentFactory.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <thread>
 #include <exception>
 #include <functional>
 #include <future>
@@ -255,6 +259,28 @@ std::string selected_dev_id()
     return m ? m->get_dev_id() : std::string();
 }
 
+json status_summary(const json& status)
+{
+    static const char* summary_keys[] = {"gcode_state",     "mc_percent",        "mc_remaining_time", "layer_num",
+                                         "total_layer_num", "subtask_name",      "nozzle_temper",     "nozzle_target_temper",
+                                         "bed_temper",      "bed_target_temper", "spd_lvl",           "print_error",
+                                         "hms",             "lights_report",     "wifi_signal"};
+    json summary = json::object();
+    for (const char* k : summary_keys)
+        if (status.contains(k))
+            summary[k] = status[k];
+    return summary;
+}
+
+std::string connection_error_text(const std::string& code)
+{
+    if (code == "5")
+        return "the printer refused the access code. Read it again from the printer's screen (Settings > "
+               "Network); it changes whenever LAN Only mode is switched on or the code is refreshed";
+    return "could not open a connection to the printer (code " + code + "). Check that it is on, on the same "
+           "network as this PC, and in LAN Only mode";
+}
+
 json cmd_printers(const json& body)
 {
     auto pa = printer_agent();
@@ -263,26 +289,101 @@ json cmd_printers(const json& body)
     r["selected"] = selected_dev_id();
     json list     = json::array();
     if (auto* lan = dynamic_cast<BambuLanPrinterAgent*>(pa.get())) {
-        static const char* summary_keys[] = {"gcode_state",     "mc_percent",    "mc_remaining_time", "layer_num",
-                                             "total_layer_num", "subtask_name",  "nozzle_temper",     "nozzle_target_temper",
-                                             "bed_temper",      "bed_target_temper", "spd_lvl",       "print_error",
-                                             "hms",             "lights_report", "wifi_signal"};
         for (const std::string& id : lan->printer_ids()) {
             json status = lan->printer_status(id);
             json item   = {{"dev_id", id}, {"connected", lan->is_printer_connected(id)}, {"camera_url", lan->camera_snapshot_url(id)}};
-            if (body.value("full", false)) {
-                item["status"] = status;
-            } else {
-                json summary = json::object();
-                for (const char* k : summary_keys)
-                    if (status.contains(k))
-                        summary[k] = status[k];
-                item["status"] = summary;
-            }
+            if (const std::string err = lan->connection_error(id); !err.empty())
+                item["error"] = connection_error_text(err);
+            item["status"] = body.value("full", false) ? status : status_summary(status);
             list.push_back(item);
         }
     }
     r["printers"] = list;
+    return r;
+}
+
+// Adds a Bambu printer by IP address and LAN access code, as the Devices tab's "connect via IP"
+// dialog does, selects it and waits for its first status report. Runs on the server thread: the
+// TLS probe and the wait take seconds, and the window stays usable meanwhile.
+json cmd_connect_printer(const json& body)
+{
+    const std::string ip     = body.value("ip", std::string());
+    const std::string code   = body.value("access_code", std::string());
+    const int         wait_s = std::clamp(body.value("timeout_s", 20), 0, 120);
+
+    boost::system::error_code ec;
+    asio::ip::make_address_v4(ip, ec);
+    if (ip.empty() || ec)
+        return json{{"error", "give the printer's IPv4 address as 'ip' (printer screen: Settings > Network)"}};
+    if (code.empty() || code.size() > 32 || code.find_first_of(" \t\r\n") != std::string::npos)
+        return json{{"error", "give the printer's LAN access code as 'access_code' (8 characters, shown under its IP)"}};
+
+    // why: the holder outlives a run_on_gui timeout, after which the GUI lambda may still write to it
+    auto agent_holder = std::make_shared<std::shared_ptr<IPrinterAgent>>();
+    json pre          = run_on_gui([agent_holder]() {
+        *agent_holder = printer_agent();
+        return json{{"agent", *agent_holder ? (*agent_holder)->get_agent_info().id : std::string()}};
+    });
+    if (pre.contains("error"))
+        return pre;
+    auto* lan = dynamic_cast<BambuLanPrinterAgent*>(agent_holder->get());
+    if (!lan)
+        return json{{"error", "the active printer preset uses the '" + pre.value("agent", std::string()) +
+                                  "' printer connection, not the open LAN one. Set its printer_agent to '" +
+                                  BAMBU_LAN_PRINTER_AGENT_ID + "' (set_settings, printer scope) and connect again"}};
+
+    // The printer's TLS certificate names its serial; no login is needed for that.
+    detectResult detect;
+    NetworkAgent* agent = wxGetApp().getAgent();
+    if (!agent || agent->bind_detect(ip, "secure", detect) < 0 || detect.dev_id.empty())
+        return json{{"error", "no Bambu printer answered on " + ip + ":8883. Check that it is on, on the same network "
+                              "as this PC, and in LAN Only mode"}};
+    const std::string dev_id = detect.dev_id;
+    const std::string name   = body.value("name", detect.dev_name.empty() ? dev_id : detect.dev_name);
+
+    json added = run_on_gui([detect, ip, code, name]() {
+        DeviceManager* dm = wxGetApp().getDeviceManager();
+        if (!dm)
+            throw std::runtime_error("the device manager is not ready");
+        BBLocalMachine machine;
+        machine.dev_id       = detect.dev_id;
+        machine.dev_name     = name;
+        machine.dev_ip       = ip;
+        machine.printer_type = detect.model_id;
+        MachineObject* obj   = dm->insert_local_device(machine, detect.connect_type.empty() ? "lan" : detect.connect_type,
+                                                       detect.bind_state.empty() ? "free" : detect.bind_state, detect.version, code);
+        if (!obj)
+            throw std::runtime_error("the printer could not be added");
+        obj->set_access_code(code); // also saves it with the printer, as the dialog does
+        if (!dm->set_selected_machine(detect.dev_id))
+            throw std::runtime_error("the printer was added but could not be selected");
+        wxGetApp().app_config->save();
+        return json{{"ok", true}};
+    });
+    if (added.contains("error"))
+        return added;
+
+    json r = {{"dev_id", dev_id}, {"name", name}, {"model", detect.model_id}, {"ip", ip}, {"connected", false}};
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(wait_s);
+    while (!s_stopping) {
+        if (const std::string err = lan->connection_error(dev_id); !err.empty())
+            return json{{"error", connection_error_text(err)}, {"dev_id", dev_id}};
+        if (lan->is_printer_connected(dev_id)) {
+            const json status = lan->printer_status(dev_id);
+            if (!status.empty()) {
+                r["connected"]  = true;
+                r["status"]     = status_summary(status);
+                r["camera_url"] = lan->camera_snapshot_url(dev_id);
+                return r;
+            }
+        }
+        if (std::chrono::steady_clock::now() > until)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    r["connected"] = lan->is_printer_connected(dev_id);
+    r["note"]      = r["connected"].get<bool>() ? "connected, but no status report arrived yet; call printers in a moment" :
+                                                  "still connecting; call printers in a moment to see whether it succeeded";
     return r;
 }
 
@@ -319,6 +420,18 @@ const std::map<std::string, Command>& commands()
     }();
     return table;
 }
+
+// Commands that run on the server thread because they wait on the network; they reach the window
+// through run_on_gui themselves.
+const std::map<std::string, Command>& background_commands()
+{
+    static const std::map<std::string, Command> table = {
+        {"connect_printer", cmd_connect_printer},
+    };
+    return table;
+}
+
+bool has_command(const std::string& name) { return commands().count(name) || background_commands().count(name); }
 
 } // namespace
 
@@ -402,9 +515,11 @@ void ControlServer::serve()
                 if (auth != "Bearer " + m_token) {
                     res.result(http::status::unauthorized);
                     res.body() = json{{"error", "missing or wrong token; read it from control_server.json"}}.dump();
-                } else if (target.rfind("/api/", 0) != 0 || !commands().count(target.substr(5))) {
+                } else if (target.rfind("/api/", 0) != 0 || !has_command(target.substr(5))) {
                     json names = json::array();
                     for (const auto& [name, fn] : commands())
+                        names.push_back(name);
+                    for (const auto& [name, fn] : background_commands())
                         names.push_back(name);
                     res.result(http::status::not_found);
                     res.body() = json{{"error", "unknown command"}, {"commands", names}}.dump();
@@ -412,9 +527,20 @@ void ControlServer::serve()
                     json body = json::object();
                     if (!req.body().empty())
                         body = json::parse(req.body(), nullptr, false);
-                    Command fn  = commands().at(target.substr(5));
-                    json    out = body.is_discarded() ? json{{"error", "the request body is not valid JSON"}} :
-                                                        run_on_gui([fn, body]() { return fn(body); });
+                    const std::string name = target.substr(5);
+                    json              out;
+                    if (body.is_discarded()) {
+                        out = json{{"error", "the request body is not valid JSON"}};
+                    } else if (auto bg = background_commands().find(name); bg != background_commands().end()) {
+                        try {
+                            out = bg->second(body);
+                        } catch (const std::exception& e) {
+                            out = json{{"error", e.what()}};
+                        }
+                    } else {
+                        Command fn = commands().at(name);
+                        out        = run_on_gui([fn, body]() { return fn(body); });
+                    }
                     if (out.contains("error"))
                         res.result(http::status::bad_request);
                     res.body() = out.dump();

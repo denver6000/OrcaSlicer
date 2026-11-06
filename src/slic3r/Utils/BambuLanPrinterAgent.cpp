@@ -171,6 +171,10 @@ int BambuLanPrinterAgent::connect_printer(const PrinterConnectionParams& params)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 fn = m_on_local_connect_fn;
+                if (state == BambuLanMqtt::State::failed)
+                    m_connect_errors[dev_id] = detail.empty() ? "-1" : detail;
+                else
+                    m_connect_errors.erase(dev_id);
             }
             if (!fn)
                 return;
@@ -190,6 +194,7 @@ int BambuLanPrinterAgent::connect_printer(const PrinterConnectionParams& params)
         c.ip          = params.host;
         c.access_code = params.password;
         c.mqtt        = std::move(mqtt);
+        m_connect_errors.erase(dev_id);
         c.mqtt->start();
         m_selected_dev_id = dev_id;
     }
@@ -257,6 +262,13 @@ bool BambuLanPrinterAgent::is_printer_connected(const std::string& dev_id) const
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_connections.find(dev_id);
     return it != m_connections.end() && it->second.mqtt && it->second.mqtt->is_connected();
+}
+
+std::string BambuLanPrinterAgent::connection_error(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_connect_errors.find(dev_id);
+    return it != m_connect_errors.end() ? it->second : std::string();
 }
 
 std::string BambuLanPrinterAgent::camera_snapshot_url(const std::string& dev_id) const

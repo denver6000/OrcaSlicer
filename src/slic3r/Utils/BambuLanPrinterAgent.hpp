@@ -85,6 +85,9 @@ public:
     nlohmann::json           printer_status(const std::string& dev_id) const;
     bool                     is_printer_connected(const std::string& dev_id) const;
     std::string              camera_snapshot_url(const std::string& dev_id) const;
+    // Why the last connection attempt failed: "5" when the printer refused the access code,
+    // another code when it could not be reached; empty while connecting or connected.
+    std::string              connection_error(const std::string& dev_id) const;
 
 private:
     struct Connection
@@ -114,6 +117,9 @@ private:
     std::string                                 m_selected_dev_id;
     std::map<std::string, nlohmann::json>       m_ssdp_seen;   // dev_id -> last SSDP announcement
     std::map<std::string, nlohmann::json>       m_status;      // dev_id -> merged "print" report
+    // dev_id -> why its last connect failed. Kept apart from m_connections because a failed
+    // connect makes the GUI deselect the printer, which drops its connection.
+    std::map<std::string, std::string>          m_connect_errors;
     std::shared_ptr<ICloudServiceAgent>         m_cloud_agent;
     std::unique_ptr<BambuLanCamera>             m_camera;
 

@@ -52,6 +52,8 @@ Good habits:
 - Orientation: analyze_orientation ranks resting positions by estimated support; apply one with
   transform_object(down=...). Then decide supports (enable_support, support_type, paint, enforcers).
 - Settings edits (set_settings) change the active presets without saving. save_preset keeps them.
+- Printers: connect_printer(ip, access_code) adds a Bambu printer in LAN Only mode; OrcaSlicer
+  then remembers it. printers shows status; camera_snapshot shows the chamber.
 
 The user is not a tuning expert. When settings come up:
 - explain(topic) gives a plain-language background (pressure advance, flow ratio, max volumetric
@@ -805,6 +807,34 @@ async def printers(full: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def connect_printer(ip: str, access_code: str, name: str | None = None, timeout_s: int = 20,
+                          switch_connection: bool = True) -> dict[str, Any]:
+    """Connect a Bambu Lab printer in LAN Only mode (Developer Mode on for printing) by its IP
+    address and access code, both shown on the printer's screen (Settings > Network). Works like
+    the Devices tab's connect-by-IP: it reads the printer's serial, saves the printer with its code
+    so OrcaSlicer reconnects on its own next time, selects it and waits up to timeout_s for its
+    first status report. Reports a refused access code or an unreachable printer as an error.
+
+    The printer preset must use the open LAN connection (printer_agent "bambu_lan"). With
+    switch_connection=True the active printer preset is switched to it when needed; that is an
+    unsaved preset edit, so save_preset(type="printer") keeps it (ask the user first)."""
+    notes: list[str] = []
+    if switch_connection:
+        agent = (await _acall("printers")).get("agent")
+        if agent != "bambu_lan":
+            await _acall("set_settings", {"values": {"printer_agent": "bambu_lan"}, "scope": "printer"})
+            notes.append(f"switched the active printer preset from the '{agent or 'bbl'}' connection to the open "
+                         "LAN one (unsaved; save_preset(type='printer') keeps it)")
+    body: dict[str, Any] = {"ip": ip, "access_code": access_code, "timeout_s": timeout_s}
+    if name:
+        body["name"] = name
+    result = await _acall("connect_printer", body, timeout=timeout_s + 30)
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+@mcp.tool()
 async def camera_snapshot(dev_id: str | None = None) -> Image:
     """The latest camera frame of a printer (default: the selected one), as a JPEG image."""
     info = await _acall("printers")
@@ -812,7 +842,7 @@ async def camera_snapshot(dev_id: str | None = None) -> Image:
     if not dev_id and info.get("selected"):
         targets = [p for p in targets if p["dev_id"] == info["selected"]] or targets
     if not targets:
-        raise RuntimeError("no connected printer; select one in the Device tab")
+        raise RuntimeError("no connected printer; connect_printer adds one")
     def fetch() -> bytes:
         with urllib.request.urlopen(targets[0]["camera_url"], timeout=15) as resp:
             return resp.read()
@@ -823,9 +853,12 @@ async def camera_snapshot(dev_id: str | None = None) -> Image:
 @mcp.tool()
 async def printer_light(on: bool, dev_id: str | None = None) -> dict[str, Any]:
     """Turn the chamber light on or off."""
-    return await _printer_request({"system": {"sequence_id": "0", "command": "ledctrl", "led_node": "chamber_light",
-                                        "led_mode": "on" if on else "off", "led_on_time": 500, "led_off_time": 500,
-                                        "loop_times": 0, "interval_time": 0}}, dev_id)
+    result = await _printer_request({"system": {"sequence_id": "0", "command": "ledctrl", "led_node": "chamber_light",
+                                          "led_mode": "on" if on else "off", "led_on_time": 500, "led_off_time": 500,
+                                          "loop_times": 0, "interval_time": 0}}, dev_id)
+    # why: P1-series printers leave lights_report out of their partial updates; a full report refreshes it
+    await _printer_request({"pushing": {"sequence_id": "0", "command": "pushall"}}, dev_id)
+    return result
 
 
 @mcp.tool()
