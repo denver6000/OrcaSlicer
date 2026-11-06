@@ -8,6 +8,9 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI assistant such 
 - paint supports, seams, filament colors and fuzzy skin, and add modifiers, support enforcers and blockers
 - set settings per object, per part and per height range
 - read what each setting means, its unit, range and allowed values
+- browse the settings page by page as the tabs show them, and open a setting in the window
+- explain advanced features (pressure advance, flow ratio, max volumetric speed...) in plain words
+- review the active presets for values worth a look
 - list, compare, select and save presets
 - set up OrcaSlicer's calibration tests for tuning a filament
 - slice, read the slice results, and take screenshots of the 3D view
@@ -43,7 +46,11 @@ Add this to `.mcp.json` in your project, or use `claude mcp add`:
 | `slicer_status` | Project, presets and unsaved edits, objects and their source files, plates and slice validity |
 | `load_models` | Load files, optionally replacing everything on the plate |
 | `reload_models_from_disk` | Reload every object from its source file, for example after a CAD re-export |
-| `get_settings` / `set_settings` | Read settings, or change them in the active process, filament or printer preset (unsaved, as if edited in the tab) |
+| `get_settings` / `set_settings` | Read settings, or change them (unsaved, as if edited in the tab). Each key goes to the preset that holds it; filament keys to a chosen filament slot. Out-of-range values are refused; changes come back as from -> to |
+| `browse_settings` | The settings tabs as laid out in the window: pages, groups, values, mode (simple/advanced/expert), unsaved and customized marks |
+| `show_setting` / `ui_mode` | Open a setting in the window and focus it; read or set Simple / Advanced / Expert view |
+| `explain` | Plain-language background on a concept: what it is, signs it is too high or low, typical values, how to calibrate, the keys involved with current values, P1S notes |
+| `review_settings` | Rules-of-thumb check of the active presets for one filament: temperatures for the material and plate, flow, pressure advance, flow limit and the speeds it caps, cooling, retraction, layers, brim, enclosure door, abrasive filament |
 | `slice` / `slice_result` | Slice a plate and wait; returns time, filament length and weight |
 | `screenshot` | Image of the 3D view (Prepare: models and paint; Preview: toolpaths and supports), optionally setting the camera first |
 | `describe_settings` | Label, tooltip, unit, range, allowed values, default and current value of settings, by key or search words |
@@ -67,6 +74,12 @@ Add this to `.mcp.json` in your project, or use `claude mcp add`:
 
 Model edits take an undo snapshot named "Claude: …", so Ctrl+Z in the slicer reverts them.
 
-The `tune_filament` prompt walks through dialing in a new filament with the calibration tests.
+Prompts:
 
-Claude Code asks before running each tool unless you allow it. Consider allowing only the read-only tools: `slicer_status`, `get_settings`, `slice_result`, `describe_settings`, `list_presets`, `preset_settings`, `preset_changes`, `list_objects`, `object_info`, `analyze_orientation`, `screenshot`, `printers` and `camera_snapshot`.
+- `tune_filament` walks through dialing in a new filament with the calibration tests, explaining each one.
+- `settings_tour` goes through the active settings page by page at your level.
+- `fix_print_problem` tracks down a print problem one change at a time.
+
+The explanations and review rules live in `guide.py`, next to the server.
+
+Claude Code asks before running each tool unless you allow it. Consider allowing only the read-only tools: `slicer_status`, `get_settings`, `slice_result`, `describe_settings`, `browse_settings`, `explain`, `review_settings`, `list_presets`, `preset_settings`, `preset_changes`, `list_objects`, `object_info`, `analyze_orientation`, `screenshot`, `printers` and `camera_snapshot`.

@@ -199,46 +199,6 @@ json cmd_get_settings(const json& body)
     return json{{"values", values}, {"missing", missing}};
 }
 
-json cmd_set_settings(const json& body)
-{
-    static const std::map<std::string, Preset::Type> scopes = {
-        {"process", Preset::TYPE_PRINT}, {"print", Preset::TYPE_PRINT}, {"filament", Preset::TYPE_FILAMENT}, {"printer", Preset::TYPE_PRINTER}};
-    const std::string scope = body.value("scope", std::string("process"));
-    auto              it    = scopes.find(scope);
-    if (it == scopes.end())
-        throw std::runtime_error("scope must be process, filament or printer");
-    if (!body.contains("values") || !body["values"].is_object())
-        throw std::runtime_error("'values' must be an object of setting -> value");
-
-    Tab* tab = wxGetApp().get_tab(it->second);
-    if (!tab || !tab->get_config())
-        throw std::runtime_error("settings tab not available");
-    DynamicPrintConfig config = *tab->get_config();
-
-    json applied = json::array();
-    json errors  = json::object();
-    for (const auto& [key, value] : body["values"].items()) {
-        if (!config.has(key)) {
-            errors[key] = "not a " + scope + " setting";
-            continue;
-        }
-        std::string text = value.is_string() ? value.get<std::string>() : value.is_boolean() ? (value.get<bool>() ? "1" : "0") : value.dump();
-        try {
-            config.set_deserialize_strict(key, text);
-            applied.push_back(key);
-        } catch (const std::exception& e) {
-            errors[key] = e.what();
-        }
-    }
-    if (!applied.empty()) {
-        // The same path as editing in the settings tab: the tab marks the preset modified and
-        // refreshes its fields, and the plater invalidates and re-slices what changed.
-        tab->load_config(config);
-        plater().on_config_change(config);
-    }
-    return json{{"applied", applied}, {"errors", errors}};
-}
-
 json cmd_slice(const json& body)
 {
     Plater& p = plater();
@@ -349,7 +309,6 @@ const std::map<std::string, Command>& commands()
             {"load_files", cmd_load_files},
             {"reload_from_disk", cmd_reload_from_disk},
             {"get_settings", cmd_get_settings},
-            {"set_settings", cmd_set_settings},
             {"slice", cmd_slice},
             {"slice_result", cmd_slice_result},
             {"printers", cmd_printers},

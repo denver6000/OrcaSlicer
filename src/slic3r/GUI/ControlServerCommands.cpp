@@ -11,10 +11,12 @@
 #include "ObjectDataViewModel.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
+#include "PresetComboBoxes.hpp"
 #include "Selection.hpp"
 #include "Tab.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -1591,10 +1593,27 @@ json cmd_select_preset(const json& body)
     const Preset&     target = find_preset(type, body.value("name", std::string()));
     const std::string name   = target.name;
 
-    if (c.get_edited_preset().is_dirty) {
-        if (!body.value("discard_changes", false))
-            throw std::runtime_error("the current " + type + " preset has unsaved changes; save_preset them, or pass discard_changes=true");
-        c.discard_current_changes();
+    // Switching a preset asks about unsaved edits in it and in the presets that depend on it
+    // (process -> filament, printer -> process and filament) with a modal dialog, which would block
+    // this request. So settle those edits here first.
+    std::vector<std::string> affected = {type};
+    if (type == "process" || type == "print") affected.push_back("filament");
+    if (type == "printer") { affected.push_back("process"); affected.push_back("filament"); }
+    std::vector<std::string> dirty;
+    for (const std::string& t : affected)
+        if (collection(t).get_edited_preset().is_dirty)
+            dirty.push_back(t);
+    if (!dirty.empty()) {
+        if (!body.value("discard_changes", false)) {
+            std::string list;
+            for (const std::string& t : dirty) list += (list.empty() ? "" : ", ") + t;
+            throw std::runtime_error("unsaved edits in the " + list + " preset(s) would be lost by this switch; save_preset them, or pass discard_changes=true");
+        }
+        for (const std::string& t : dirty) {
+            collection(t).discard_current_changes();
+            if (t != type)
+                wxGetApp().get_tab(preset_type(t))->load_current_preset();
+        }
     }
     if (type == "filament") {
         const size_t slot = body.value("slot", 0);
@@ -1623,8 +1642,10 @@ json cmd_discard_preset_changes(const json& body)
         PresetCollection& c = collection(type);
         if (!c.get_edited_preset().is_dirty)
             continue;
+        // What the tab's revert button does. select_preset() would also work, but it asks the user
+        // about other presets' unsaved edits in a modal dialog, which blocks this request.
         c.discard_current_changes();
-        wxGetApp().get_tab(preset_type(type))->select_preset(c.get_selected_preset_name(), false, "", true);
+        wxGetApp().get_tab(preset_type(type))->load_current_preset();
         reset.push_back(type);
     }
     p.on_config_change(wxGetApp().preset_bundle->full_config());
@@ -1644,6 +1665,296 @@ json cmd_save_preset(const json& body)
     if (!tab->save_preset(name, body.value("detach", false), false, false, "", true))
         throw std::runtime_error("saving was refused (see the slicer window)");
     return json{{"type", type}, {"saved", name}, {"selected", c.get_selected_preset_name()}};
+}
+
+// ---------------------------------------------------------------------------- reading and editing settings
+
+std::string utf8(const wxString& s) { return std::string(s.ToUTF8().data()); }
+
+std::string base_key(const std::string& opt_id) { return opt_id.substr(0, opt_id.find('#')); }
+
+std::set<std::string> base_keys(const std::vector<std::string>& keys)
+{
+    std::set<std::string> out;
+    for (const std::string& k : keys)
+        out.insert(base_key(k));
+    return out;
+}
+
+ConfigOptionMode mode_from(const std::string& s)
+{
+    if (s == "simple") return comSimple;
+    if (s == "advanced") return comAdvanced;
+    if (s == "expert") return comExpert;
+    if (s == "develop") return comDevelop;
+    throw std::runtime_error("mode must be simple, advanced, expert or develop");
+}
+
+// Long values (G-code, notes) are cut so a page listing stays readable.
+std::string short_value(const DynamicPrintConfig& config, const std::string& key)
+{
+    std::string v = config.opt_serialize(key);
+    if (v.size() > 160)
+        v = v.substr(0, 120) + "... (" + std::to_string(v.size()) + " chars; read it with get_settings)";
+    return v;
+}
+
+// Numbers held by an option, to check them against the setting's min/max.
+std::vector<double> numbers_of(const ConfigOption* opt)
+{
+    std::vector<double> out;
+    if (!opt) return out;
+    if (auto* o = dynamic_cast<const ConfigOptionFloat*>(opt)) out.push_back(o->value);
+    else if (auto* o = dynamic_cast<const ConfigOptionInt*>(opt)) out.push_back(o->value);
+    else if (auto* o = dynamic_cast<const ConfigOptionFloats*>(opt)) out.assign(o->values.begin(), o->values.end());
+    else if (auto* o = dynamic_cast<const ConfigOptionFloatsNullable*>(opt)) {
+        for (size_t i = 0; i < o->values.size(); ++i) if (!o->is_nil(i)) out.push_back(o->values[i]);
+    }
+    else if (auto* o = dynamic_cast<const ConfigOptionInts*>(opt)) out.assign(o->values.begin(), o->values.end());
+    else if (auto* o = dynamic_cast<const ConfigOptionIntsNullable*>(opt)) {
+        for (size_t i = 0; i < o->values.size(); ++i) if (!o->is_nil(i)) out.push_back(o->values[i]);
+    }
+    else if (auto* o = dynamic_cast<const ConfigOptionFloatOrPercent*>(opt)) { if (!o->percent) out.push_back(o->value); }
+    return out;
+}
+
+// The settings tabs as the user sees them: pages, then option groups, then settings. Without a
+// page: an outline with counts. With a page (or changed_only): every setting with its value.
+json cmd_settings_layout(const json& body)
+{
+    const std::string scope = body.value("scope", std::string("process"));
+    Tab*              tab   = wxGetApp().get_tab(preset_type(scope));
+    if (!tab || !tab->get_config())
+        throw std::runtime_error("settings tab not available");
+    PresetCollection&         c        = collection(scope);
+    const DynamicPrintConfig& config   = c.get_edited_preset().config;
+    const std::set<std::string> unsaved  = base_keys(c.current_dirty_options());
+    const std::set<std::string> custom   = c.get_selected_preset_parent() ? base_keys(c.current_different_from_parent_options()) : std::set<std::string>();
+    const std::string         page_filter  = lower(body.value("page", std::string()));
+    const std::string         group_filter = lower(body.value("group", std::string()));
+    const bool                changed_only = body.value("changed_only", false);
+    const ConfigOptionMode    max_mode     = body.contains("max_mode") ? mode_from(body["max_mode"].get<std::string>()) : comDevelop;
+    const bool                detail       = !page_filter.empty() || !group_filter.empty() || changed_only;
+
+    json pages = json::array();
+    for (const PageShp& page : tab->pages()) {
+        const std::string title = utf8(page->title());
+        if (!page_filter.empty() && lower(title).find(page_filter) == std::string::npos)
+            continue;
+        json groups = json::array();
+        for (const ConfigOptionsGroupShp& g : page->m_optgroups) {
+            const std::string gtitle = utf8(g->title);
+            if (!group_filter.empty() && lower(gtitle).find(group_filter) == std::string::npos)
+                continue;
+            json settings = json::array();
+            std::set<std::string> seen;
+            size_t count = 0, changed = 0;
+            for (const Line& line : g->get_lines()) {
+                for (const Option& o : line.get_options()) {
+                    const std::string key = base_key(o.opt.opt_key.empty() ? o.opt_id : o.opt.opt_key);
+                    if (key.empty() || !config.has(key) || !seen.insert(key).second || o.opt.mode > max_mode)
+                        continue;
+                    const bool is_unsaved = unsaved.count(key) > 0, is_custom = custom.count(key) > 0;
+                    ++count;
+                    changed += (is_unsaved || is_custom);
+                    if (!detail || (changed_only && !is_unsaved && !is_custom))
+                        continue;
+                    // On lines with several fields ("Min fan speed threshold: Fan speed, Layer time")
+                    // the field labels alone repeat, so they get the line's label in front.
+                    std::string label = o.opt.full_label.empty() ? o.opt.label : o.opt.full_label;
+                    if (line.get_options().size() > 1 && !line.label.empty() && utf8(line.label) != label)
+                        label = utf8(line.label) + ": " + label;
+                    json s = {{"key", key},
+                              {"label", label},
+                              {"value", short_value(config, key)},
+                              {"mode", mode_name(o.opt.mode)}};
+                    if (!o.opt.sidetext.empty()) s["unit"] = o.opt.sidetext;
+                    if (is_unsaved) s["unsaved_edit"] = true;
+                    if (is_custom) s["differs_from_system"] = true;
+                    settings.push_back(s);
+                }
+            }
+            if (count == 0 || (changed_only && settings.empty()))
+                continue;
+            json gj = {{"group", gtitle}, {"settings_count", count}};
+            if (changed) gj["changed_count"] = changed;
+            if (detail) gj["settings"] = settings;
+            groups.push_back(gj);
+        }
+        if (!groups.empty())
+            pages.push_back(json{{"page", title}, {"groups", groups}});
+    }
+    json r = {{"scope", scope},
+              {"preset", c.get_edited_preset().name},
+              {"ui_mode", wxGetApp().get_mode_str()},
+              {"pages", pages}};
+    if (!detail)
+        r["note"] = "outline only: pass page (or group, or changed_only=true) to list the settings with their values";
+    return r;
+}
+
+// Puts the filament settings tab on a filament slot, as the slot's edit button does.
+void bind_filament_tab(size_t slot)
+{
+    PresetBundle* pb = wxGetApp().preset_bundle;
+    if (slot >= pb->filament_presets.size())
+        throw std::runtime_error("there are " + std::to_string(pb->filament_presets.size()) + " filament slots");
+    Tab* tab = wxGetApp().get_tab(Preset::TYPE_FILAMENT);
+    const std::string& name = pb->filament_presets[slot];
+    if (name != pb->filaments.get_selected_preset_name()) {
+        if (pb->filaments.get_edited_preset().is_dirty)
+            throw std::runtime_error("the filament tab has unsaved edits to '" + pb->filaments.get_edited_preset().name +
+                                     "'; save_preset or discard_preset_changes them before editing slot " + std::to_string(slot));
+        if (!tab->select_preset(name))
+            throw std::runtime_error("could not open '" + name + "' in the filament tab");
+    }
+    tab->get_combo_box()->set_filament_idx(int(slot));
+}
+
+// Edits the active presets as typing into the settings tabs does. Each key goes to the preset
+// that holds it (scope "auto"), values outside the setting's min/max are refused, and the reply
+// lists every change as from -> to.
+json cmd_set_settings(const json& body)
+{
+    if (!body.contains("values") || !body["values"].is_object())
+        throw std::runtime_error("'values' must be an object of setting -> value");
+    const std::string scope = body.value("scope", std::string("auto"));
+    if (scope != "auto")
+        (void) preset_type(scope); // validates the name
+
+    std::map<std::string, std::vector<std::pair<std::string, json>>> by_scope;
+    json errors = json::object();
+    for (const auto& [key, value] : body["values"].items()) {
+        const std::string s = scope_of(key);
+        if (s == "other")
+            errors[key] = print_config_def.get(key) ? "not stored in a preset (a project or machine-only setting)" : "unknown setting (describe_settings finds the right key)";
+        else if (scope != "auto" && s != (scope == "print" ? "process" : scope))
+            errors[key] = "a " + s + " setting, not " + scope + " (leave scope as auto)";
+        else
+            by_scope[s].emplace_back(key, value);
+    }
+
+    json changes = json::object(), notes = json::array();
+    const ConfigOptionMode ui_mode = wxGetApp().get_mode();
+    if (by_scope.count("filament"))
+        bind_filament_tab(body.value("slot", 0));
+    for (auto& [s, items] : by_scope) {
+        Tab* tab = wxGetApp().get_tab(preset_type(s));
+        if (!tab || !tab->get_config())
+            throw std::runtime_error("settings tab not available");
+        DynamicPrintConfig config = *tab->get_config();
+        bool any = false;
+        for (const auto& [key, value] : items) {
+            const ConfigOptionDef* def  = print_config_def.get(key);
+            const std::string      text = value.is_string() ? value.get<std::string>() : value.is_boolean() ? (value.get<bool>() ? "1" : "0") : value.dump();
+            if (!config.has(key)) {
+                errors[key] = "not in the active " + s + " preset";
+                continue;
+            }
+            const std::string before = config.opt_serialize(key);
+            DynamicPrintConfig trial = config;
+            try {
+                trial.set_deserialize_strict(key, text);
+            } catch (const std::exception& e) {
+                errors[key] = std::string("invalid value: ") + e.what();
+                continue;
+            }
+            // Some settings carry no max in their definition; these are the ones a typo makes dangerous.
+            double hard_max = def && def->max < FLT_MAX ? def->max : FLT_MAX;
+            if (key.rfind("nozzle_temperature", 0) == 0 && key.find("range") == std::string::npos) hard_max = std::min(hard_max, 350.);
+            if (key.find("plate_temp") != std::string::npos) hard_max = std::min(hard_max, 130.);
+            if (key == "chamber_temperature") hard_max = std::min(hard_max, 80.);
+            std::string range_error;
+            for (double v : numbers_of(trial.option(key))) {
+                if (def && def->min > -FLT_MAX && v < def->min) range_error = "below the minimum " + float_to_string_decimal_point(def->min);
+                if (v > hard_max) range_error = "above the maximum " + float_to_string_decimal_point(hard_max);
+            }
+            if (!range_error.empty()) {
+                errors[key] = range_error;
+                continue;
+            }
+            // A single value given for a per-variant list (e.g. "0.02,0.02") fills every entry, as the tab does.
+            const auto* old_vec = dynamic_cast<const ConfigOptionVectorBase*>(config.option(key));
+            const size_t old_n  = old_vec ? old_vec->size() : 0;
+            config.set_deserialize_strict(key, text);
+            if (auto* vec = dynamic_cast<ConfigOptionVectorBase*>(config.option(key)); vec && old_n > 1 && vec->size() == 1)
+                vec->resize(old_n);
+            any = true;
+            changes[key] = {{"from", before}, {"to", config.opt_serialize(key)}, {"preset", s}};
+            if (def && def->mode > ui_mode)
+                notes.push_back(key + " is shown only in the " + mode_name(def->mode) + " view of the settings (ui_mode); show_setting switches to it");
+            if (key == "nozzle_temperature" && config.has("nozzle_temperature_range_low") && config.has("nozzle_temperature_range_high")) {
+                const auto lo = numbers_of(config.option("nozzle_temperature_range_low")), hi = numbers_of(config.option("nozzle_temperature_range_high"));
+                for (double v : numbers_of(config.option(key)))
+                    if (!lo.empty() && !hi.empty() && hi[0] > lo[0] && (v < lo[0] || v > hi[0])) {
+                        notes.push_back("nozzle_temperature " + float_to_string_decimal_point(v) + " is outside this filament's recommended " +
+                                        float_to_string_decimal_point(lo[0]) + "-" + float_to_string_decimal_point(hi[0]));
+                        break;
+                    }
+            }
+        }
+        if (any) {
+            // The path an edit in the settings tab takes: the tab marks the preset modified and
+            // refreshes its fields, and the plater invalidates what changed.
+            tab->load_config(config);
+            plater().on_config_change(config);
+        }
+    }
+    json r = {{"changes", changes}, {"errors", errors}};
+    if (!notes.empty()) r["notes"] = notes;
+    if (by_scope.count("filament")) {
+        r["filament_slot"] = body.value("slot", 0);
+        r["filament_preset"] = wxGetApp().preset_bundle->filaments.get_edited_preset().name;
+    }
+    return r;
+}
+
+// Opens the settings tab on a setting and focuses it, as picking it in the search box does.
+json cmd_show_setting(const json& body)
+{
+    const std::string key = body.value("key", std::string());
+    const std::string s   = scope_of(key);
+    if (s == "other")
+        throw std::runtime_error("'" + key + "' is not a preset setting");
+    if (s == "filament" && body.contains("slot"))
+        bind_filament_tab(body["slot"].get<size_t>());
+    const ConfigOptionDef* def = print_config_def.get(key);
+    json r = {{"key", key}, {"preset", s}};
+    if (def && def->mode > wxGetApp().get_mode()) {
+        if (body.value("raise_mode", true)) {
+            wxGetApp().set_mode(def->mode == comDevelop ? comExpert : def->mode);
+            r["ui_mode_now"] = wxGetApp().get_mode_str();
+        } else
+            r["note"] = "hidden at the current ui_mode; raise it to see this setting";
+    }
+    // The tab's fields are keyed by option id ("pressure_advance#0" for list settings) and its
+    // page search compares bare keys, so look both up here and hand over the page by name.
+    std::string  opt_id = key;
+    std::wstring page_title;
+    if (Tab* tab = wxGetApp().get_tab(preset_type(s)))
+        for (const PageShp& page : tab->pages()) {
+            for (const ConfigOptionsGroupShp& g : page->m_optgroups)
+                for (const Line& line : g->get_lines())
+                    for (const Option& o : line.get_options())
+                        if (base_key(o.opt.opt_key.empty() ? o.opt_id : o.opt.opt_key) == key && page_title.empty()) {
+                            opt_id     = o.opt_id;
+                            page_title = page->title().ToStdWstring();
+                            r["page"]  = utf8(page->title());
+                            r["group"] = utf8(g->title);
+                        }
+            if (!page_title.empty())
+                break;
+        }
+    wxGetApp().sidebar().jump_to_option(opt_id, preset_type(s), page_title);
+    return r;
+}
+
+// Simple / Advanced / Expert: how many settings the tabs show.
+json cmd_ui_mode(const json& body)
+{
+    if (body.contains("mode"))
+        wxGetApp().set_mode(mode_from(body["mode"].get<std::string>()));
+    return json{{"ui_mode", wxGetApp().get_mode_str()}};
 }
 
 // ---------------------------------------------------------------------------- calibration
@@ -1739,6 +2050,10 @@ void add_model_commands(std::map<std::string, Handler>& table)
     table["discard_preset_changes"] = cmd_discard_preset_changes;
     table["save_preset"]           = cmd_save_preset;
     table["calibrate"]             = cmd_calibrate;
+    table["settings_layout"]       = cmd_settings_layout;
+    table["set_settings"]          = cmd_set_settings;
+    table["show_setting"]          = cmd_show_setting;
+    table["ui_mode"]               = cmd_ui_mode;
 }
 
 }}} // namespace Slic3r::GUI::ControlCommands

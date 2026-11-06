@@ -30,6 +30,9 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guide  # noqa: E402  (plain-language explanations and the settings review)
+
 INSTRUCTIONS = """\
 Drives the user's running OrcaSlicer. Every change shows up live in their window and can be undone
 there (or with model_action("undo")).
@@ -49,6 +52,16 @@ Good habits:
 - Orientation: analyze_orientation ranks resting positions by estimated support; apply one with
   transform_object(down=...). Then decide supports (enable_support, support_type, paint, enforcers).
 - Settings edits (set_settings) change the active presets without saving. save_preset keeps them.
+
+The user is not a tuning expert. When settings come up:
+- explain(topic) gives a plain-language background (pressure advance, flow ratio, max volumetric
+  speed, cooling, retraction, seams...). Pass it on in your own words, briefly, before changing
+  anything advanced.
+- browse_settings shows the settings the way the tabs lay them out; review_settings flags values
+  worth a look for the active filament, plate and printer.
+- Say what you change and why, as old -> new (set_settings reports both). Change one thing at a
+  time when chasing a print problem, so the effect can be seen.
+- show_setting opens the setting in the slicer window so the user can see where it lives.
 - Never start a print or send G-code unless the user asked for it.
 """
 
@@ -145,15 +158,101 @@ async def get_settings(keys: list[str] | None = None, search: str | None = None)
 
 
 @mcp.tool()
-async def set_settings(values: dict[str, Any], scope: str = "process") -> dict[str, Any]:
-    """Change settings in the active preset, exactly as editing them in the settings tab would
-    (the preset shows as modified; nothing is saved). scope is "process", "filament" or
-    "printer". Values use the slicer's own text forms, e.g. {"layer_height": 0.16,
-    "sparse_infill_density": "15%", "enable_support": true}. The filament scope edits the
-    preset shown in the Filament settings tab (slicer_status: filament_tab_preset); per-filament
-    values are lists, one entry per filament slot, e.g. "nozzle_temperature": "215".
-    Use describe_settings first to see what a setting means and its allowed values."""
-    return await _acall("set_settings", {"scope": scope, "values": values})
+async def set_settings(values: dict[str, Any], scope: Literal["auto", "process", "filament", "printer"] = "auto",
+                       slot: int = 0) -> dict[str, Any]:
+    """Change settings in the active presets, exactly as editing them in the settings tabs would
+    (the presets show as modified; nothing is saved until save_preset). Keys from different presets
+    can be mixed: each goes to the preset that holds it (scope "auto"). Values use the slicer's
+    text forms, e.g. {"layer_height": 0.16, "sparse_infill_density": "15%", "enable_support": true,
+    "nozzle_temperature": 215, "pressure_advance": 0.035}. Filament settings go to the filament in
+    `slot` (0 = first); that fails while another filament has unsaved edits.
+    Values outside a setting's min/max are refused. Returns each change as from -> to, plus notes
+    when a setting is hidden at the user's current ui_mode.
+    For a single object instead of the whole plate, use object_settings."""
+    return await _acall("set_settings", {"scope": scope, "values": values, "slot": slot})
+
+
+@mcp.tool()
+async def browse_settings(
+    scope: Literal["process", "filament", "printer"] = "process",
+    page: str | None = None,
+    group: str | None = None,
+    changed_only: bool = False,
+    max_mode: Literal["simple", "advanced", "expert", "develop"] | None = None,
+) -> dict[str, Any]:
+    """The settings as the slicer's tabs lay them out: pages (e.g. Quality, Strength, Speed,
+    Support, Others for process; Filament, Cooling, Setting Overrides, Advanced for filament)
+    with their option groups. Without page/group: an outline with counts of settings and of
+    changed ones. With page or group (part of the title): every setting with label, value, unit,
+    mode (simple/advanced/expert) and whether it has unsaved edits or differs from the system
+    preset. changed_only=True lists only changed settings across all pages. max_mode="simple"
+    shows only what the Simple view shows."""
+    body: dict[str, Any] = {"scope": scope, "changed_only": changed_only}
+    if page:
+        body["page"] = page
+    if group:
+        body["group"] = group
+    if max_mode:
+        body["max_mode"] = max_mode
+    return await _acall("settings_layout", body)
+
+
+@mcp.tool()
+async def show_setting(key: str, slot: int | None = None, raise_mode: bool = True) -> dict[str, Any]:
+    """Open the settings tab on a setting and focus its field in the slicer window, so the user
+    sees where it lives (for example after explaining or changing it). If the setting is hidden
+    at the current ui_mode, the mode is raised (raise_mode=False to leave it). slot picks the
+    filament for filament settings."""
+    body: dict[str, Any] = {"key": key, "raise_mode": raise_mode}
+    if slot is not None:
+        body["slot"] = slot
+    return await _acall("show_setting", body)
+
+
+@mcp.tool()
+async def ui_mode(mode: Literal["simple", "advanced", "expert"] | None = None) -> dict[str, Any]:
+    """Read or set how many settings the slicer's tabs show: simple (the basics), advanced, or
+    expert (everything). Without mode, returns the current one."""
+    return await _acall("ui_mode", {"mode": mode} if mode else {})
+
+
+@mcp.tool()
+async def explain(topic: str | None = None, include_current: bool = True) -> dict[str, Any]:
+    """Plain-language background on a printing concept or advanced feature: what it is, signs it
+    is set too high or too low, typical values, how to set or calibrate it, the setting keys
+    involved (with their current values) and notes for Bambu enclosed printers. topic can be a
+    word or phrase ("pressure advance", "stringing", "flow ratio", "seams", "heat creep", "PA").
+    Without a topic, lists the topics. For any single setting's official description, use
+    describe_settings."""
+    if not topic:
+        return {"topics": guide.topic_list()}
+    matches = guide.find_topic(topic)
+    if not matches:
+        return {"error": f"no topic matches {topic!r}; try describe_settings(search=...)", "topics": guide.topic_list()}
+    entry = {k: v for k, v in guide.TOPICS[matches[0]].items() if k != "aliases"}
+    out: dict[str, Any] = {"topic": matches[0], **entry}
+    if include_current and entry.get("keys"):
+        try:
+            got = await _acall("get_settings", {"keys": entry["keys"]})
+            out["current_values"] = got.get("values", {})
+        except RuntimeError as e:
+            out["current_values_error"] = str(e)
+    if len(matches) > 1:
+        out["related_topics"] = matches[1:4]
+    return out
+
+
+@mcp.tool()
+async def review_settings(slot: int = 0) -> dict[str, Any]:
+    """Look over the active printer, process and filament presets (for one filament slot) the
+    way an experienced user would: nozzle and bed temperature for the material and plate, flow
+    ratio, pressure advance, max volumetric speed and which speeds it actually caps, cooling,
+    retraction, layer and first-layer settings, walls and top layers, brim for warping
+    materials, enclosure door advice and abrasive filament on a soft nozzle. Each finding has a
+    level (error/warn/info), the explain() topic for background, current values and a
+    suggestion. These are rules of thumb, not calibration: say so to the user."""
+    got = await _acall("get_settings", {"keys": guide.REVIEW_KEYS})
+    return guide.review(got.get("values", {}), slot)
 
 
 @mcp.tool()
@@ -268,7 +367,8 @@ async def select_preset(
     discard_changes: bool = False,
 ) -> dict[str, Any]:
     """Select a preset, as picking it in the sidebar does. For filaments, slot is the filament
-    slot (0 = first). Fails if the current preset of that type has unsaved edits, unless
+    slot (0 = first). Fails if a switch would lose unsaved edits (in this preset type, and for a
+    process also the filament, for a printer also process and filament), unless
     discard_changes=True (or save them first with save_preset)."""
     return await _acall("select_preset", {"type": type, "name": name, "slot": slot, "discard_changes": discard_changes})
 
@@ -624,7 +724,7 @@ async def _wait_idle(timeout_s: float = 120) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         await asyncio.sleep(0.5)
-        if not await _acall("status").get("busy"):
+        if not (await _acall("status")).get("busy"):
             return False
     return True
 
@@ -634,21 +734,62 @@ async def _wait_idle(timeout_s: float = 120) -> bool:
 
 @mcp.prompt()
 def tune_filament(filament: str, printer_notes: str = "") -> str:
-    """Workflow for dialing in a new filament with OrcaSlicer's calibration tests."""
+    """Workflow for dialing in a new filament with OrcaSlicer's calibration tests, explained for
+    someone new to tuning."""
     return f"""Help me dial in the filament "{filament}" on my printer. {printer_notes}
+I am new to tuning: before each test, tell me in two or three sentences what it measures and why
+(explain() has the background), and afterwards what the result changed.
 
 1. list_presets(type="filament", filter=...) to find the closest system preset; preset_settings
-   to read it and compare_to a sibling. select_preset it, then save_preset under a new name
-   (e.g. "{filament} - tuned") so the edits have a home.
-2. Read the maker's ranges (nozzle and bed temperature, max speed) from me or the spool label;
-   set them with set_settings(scope="filament").
-3. Calibrate in this order, one test at a time:
+   to read it, compare_to a sibling if useful. select_preset it, then save_preset under a new
+   name (e.g. "{filament} - tuned") so the results have a home.
+2. Ask me for the spool label's ranges (nozzle and bed temperature, max speed); set them with
+   set_settings. Run review_settings and go through anything it flags.
+3. Calibrate in this order, one test at a time (explain("calibration_order") says why):
    temperature -> flow_rate pass 1 -> flow_rate pass 2 -> pressure_advance -> retraction ->
-   max_volumetric_speed. For each: calibrate, slice, screenshot(tab="preview") to check it,
-   then I print it and tell you what I see. Then discard_preset_changes (the test's own edits),
-   set the value I found with set_settings(scope="filament") and save_preset. Use
-   describe_settings to name the exact keys before setting them.
-4. Finish with a summary of the final values next to the starting ones (preset_changes).
+   max_volumetric_speed (-> vfa if walls show fine vertical lines).
+   For each: calibrate, slice, screenshot(tab="preview") to check it, then I print it and tell
+   you what I see (or send a photo). Then discard_preset_changes (the test's own edits), set the
+   value I found with set_settings, save_preset, and show_setting so I see where it lives.
+4. Finish with a table of the final values next to the starting ones (preset_changes).
+Never start a print yourself."""
+
+
+@mcp.prompt()
+def settings_tour(focus: str = "", level: str = "beginner") -> str:
+    """A guided look through the active settings at the user's level, with explanations."""
+    about = f" for {focus}" if focus else ""
+    return f"""Walk me through my current slicer settings{about}. My level: {level}.
+
+1. slicer_status for the printer, filament and process presets; review_settings for anything
+   worth fixing first. Tell me the findings in plain words, most important first.
+2. browse_settings(scope="process") for the outline, then go page by page (Quality, Strength,
+   Speed, Support, Others), then the filament (Filament, Cooling, Setting Overrides), then the
+   printer only if it matters. For each page, explain only the settings that matter for my
+   prints, what the current value does, and when I would change it. Use explain() for the
+   background of advanced features (pressure advance, flow ratio, max volumetric speed, seams...)
+   and describe_settings for exact meanings, units and ranges.
+3. Do not change anything unless I ask. When I do: set_settings (report old -> new), then
+   show_setting so I see it in the window. Offer save_preset at the end.
+Keep each step short and ask before moving to the next page."""
+
+
+@mcp.prompt()
+def fix_print_problem(problem: str) -> str:
+    """Track down a print problem (stringing, warping, poor surface, weak parts...) one change at a time."""
+    return f"""My print has a problem: {problem}
+
+1. explain() the problem's topic to find the likely causes; ask me the questions that tell them
+   apart (where on the part, from the first layer or later, which filament, how old or dry the
+   spool is, door open or closed). A photo helps: ask for one, or camera_snapshot if a print is
+   running.
+2. review_settings and get_settings for the settings involved; check_errors and object_info if
+   the model or orientation could be the cause.
+3. Suggest the most likely cause first, with one change (old -> new) and why. Prefer free fixes
+   (clean plate, dry filament, door open or closed, orientation) before settings, and a
+   calibration test over a guess when the value is unknown.
+4. Apply it only when I agree (set_settings or object_settings), show_setting it, and suggest a
+   small test print (cut_object can keep just the problem height) before a full reprint.
 Never start a print yourself."""
 
 
